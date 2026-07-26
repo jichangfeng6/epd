@@ -22,6 +22,9 @@ let slotActionTimer = null;
 let slotReadTimer = null;
 let slotEraseAllPending = false;
 let displayErrorActive = false;
+let customCalendarFontFamily = '';
+let calendarStyleRenderTimer = null;
+let calendarStyleImageActive = false;
 
 const MAX_SLOT_IMAGE_SIZE = 1024 * 1024;
 const DEFAULT_SLOT_READ_RAW_CHUNK_SIZE = 256;
@@ -29,7 +32,7 @@ const SLOT_READ_TIMEOUT_MS = 5000;
 const SLOT_READ_INFO_TIMEOUT_MS = 8000;
 const SLOT_CHUNK_MAX_RETRIES = 2;
 const IMAGE_REFRESH_TIMEOUT_MS = 95000;
-const SLOT_IMAGE_CACHE_PREFIX = 'epd-slot-preview-v1:';
+const SLOT_IMAGE_CACHE_PREFIX = 'epd-slot-preview-v2:';
 const SLOT_PREVIEW_MAX_EDGE = 480;
 const SLOT_PREVIEW_JPEG_QUALITY = 0.88;
 
@@ -78,6 +81,7 @@ const EpdCmd = {
   FREE_SLOT: 0x32,
   SET_SLIDE: 0x33,
   GET_IMAGE: 0x34,
+  GET_SLOTS: 0x35,
 
   SET_CONFIG: 0x90,
   SYS_RESET: 0x91,
@@ -235,7 +239,7 @@ function formatSlotBytes(size) {
 }
 
 function slotColorName(colorId) {
-  return colorId === 0 ? '黑白' : colorId === 1 ? '黑白红' : colorId === 2 ? '黑白红黄' : '未知';
+  return colorId === 2 ? '黑白' : colorId === 3 ? '黑白红' : colorId === 4 ? '黑白红黄' : '未知';
 }
 
 function rleEncode(data, maxLiteral = 128) {
@@ -443,7 +447,7 @@ function cacheCurrentSlotPreview(slot, processedData, mode) {
       ? ditherSourceImageData
       : ctx.getImageData(0, 0, canvas.width, canvas.height);
     const dataUrl = createSlotPreviewDataUrl(sourceImageData);
-    const colorId = mode === 'blackWhiteColor' ? 0 : mode === 'threeColor' ? 1 : 2;
+    const colorId = mode === 'blackWhiteColor' ? 2 : mode === 'threeColor' ? 3 : 4;
     slotPreviewPending.add(slot);
     saveSlotImageCache(slot, {
       width: canvas.width,
@@ -579,7 +583,7 @@ function renderSlotGrid(forceDisabled = imageTransferActive || slotActionPending
 async function refreshSlots() {
   if (!isBleConnected()) return;
   addLog('正在读取图片槽位...');
-  await write(EpdCmd.INIT);
+  await write(EpdCmd.GET_SLOTS);
 }
 
 function applySlotsMessage(message) {
@@ -1008,9 +1012,9 @@ function normalizeSlotImageData(meta) {
     (isGDEM037F51Driver(driverSelect) || isGDEY037Z03Driver(driverSelect));
   if (!needsNativeRotation) return meta.data;
 
-  if (meta.colorId === 2) return restoreRotated2bpp(meta.data, meta.width, meta.height);
-  if (meta.colorId === 0) return restoreRotated1bpp(meta.data, meta.width, meta.height);
-  if (meta.colorId === 1) {
+  if (meta.colorId === 4) return restoreRotated2bpp(meta.data, meta.width, meta.height);
+  if (meta.colorId === 2) return restoreRotated1bpp(meta.data, meta.width, meta.height);
+  if (meta.colorId === 3) {
     const planeSize = Math.floor(meta.data.length / 2);
     const output = new Uint8Array(meta.data.length);
     output.set(restoreRotated1bpp(meta.data.slice(0, planeSize), meta.width, meta.height), 0);
@@ -1047,7 +1051,8 @@ function finishSlotImageRead() {
   clearSlotReadTimer();
   slotReadState = null;
   try {
-    const mode = meta.colorId === 0 ? 'blackWhiteColor' : meta.colorId === 1 ? 'threeColor' : 'fourColor';
+    const mode = meta.colorId === 2 ? 'blackWhiteColor' : meta.colorId === 3 ? 'threeColor' :
+      meta.colorId === 4 ? 'fourColor' : meta.colorId === 6 ? 'sixColor' : 'sevenColor';
     const normalized = normalizeSlotImageData(meta);
     const driverValue = document.getElementById('epddriver').value.toLowerCase();
     const imageData = (driverValue === '08' || driverValue === '09')
@@ -1507,6 +1512,8 @@ function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPen
   document.getElementById("clockmodebutton").disabled = status;
   document.getElementById("clearscreenbutton").disabled = status;
   document.getElementById("sendimgbutton").disabled = status;
+  const calendarStyleSend = document.getElementById("calendarStyleSend");
+  if (calendarStyleSend) calendarStyleSend.disabled = Boolean(status);
   document.getElementById("setDriverbutton").disabled = status;
   document.getElementById("ledEnabled").disabled = Boolean(status) || appVersion < LED_CONTROL_MIN_VERSION;
   document.getElementById("refreshSlotsButton").disabled = status;
@@ -1747,6 +1754,13 @@ async function connect() {
     if (e.message) addLog("startNotifications: " + e.message);
   }
 
+  // Query slots separately. Old firmware ignores 0x35 and still reports slots from INIT.
+  try {
+    await refreshSlots();
+  } catch (slotError) {
+    addLog(`自动读取槽位失败（不影响使用）：${slotError.message || slotError}`);
+  }
+
   await write(EpdCmd.INIT);
 
   document.getElementById("connectbutton").innerHTML = '断开';
@@ -1809,6 +1823,7 @@ function cloneImageData(imageData) {
 function resetDitherPreviewSource() {
   ditherSourceImageData = null;
   ditherPreviewActive = false;
+  calendarStyleImageActive = false;
 }
 
 function setCanvasTitle(title) {
@@ -1869,6 +1884,7 @@ function updateCanvasSize() {
   canvas.height = selectedSize.height;
 
   updateImage();
+  scheduleCalendarStylePreview();
 }
 
 function updateDitcherOptions() {
@@ -1942,6 +1958,7 @@ function processCanvasImageData() {
     ditherSourceImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   }
   const sourceImageData = cloneImageData(ditherSourceImageData);
+  if (calendarStyleImageActive) return processImageData(sourceImageData, settings.mode);
   const imageData = prepareDitherImageData(sourceImageData, settings);
   return processImageData(ditherImage(imageData, settings.alg, settings.strength, settings.mode), settings.mode);
 }
@@ -1979,6 +1996,570 @@ function resetDitherAdjustments() {
   setDitherAdjustment('ditherBrightness', 0, 0);
   setDitherAdjustment('ditherSaturation', 1.2, 1);
   applyDither();
+}
+
+const CALENDAR_PREVIEW_COLORS = Object.freeze({
+  white: '#ffffff',
+  black: '#000000',
+  red: '#d71920',
+  yellow: '#f5d328'
+});
+const CALENDAR_FONT_DEFAULTS = Object.freeze({
+  title: 28,
+  mainDay: 170,
+  weekday: 28,
+  cellDay: 24,
+  cellLunar: 13
+});
+const LUNAR_DAY_NAMES = [
+  '', '初一', '初二', '初三', '初四', '初五', '初六', '初七', '初八', '初九', '初十',
+  '十一', '十二', '十三', '十四', '十五', '十六', '十七', '十八', '十九', '二十',
+  '廿一', '廿二', '廿三', '廿四', '廿五', '廿六', '廿七', '廿八', '廿九', '三十'
+];
+const ZODIAC_NAMES = ['鼠', '牛', '虎', '兔', '龙', '蛇', '马', '羊', '猴', '鸡', '狗', '猪'];
+
+function getCalendarStyleElements() {
+  return {
+    panel: document.getElementById('calendarStylePanel'),
+    toggle: document.getElementById('calendarstylebutton'),
+    preview: document.getElementById('calendarStylePreview'),
+    layout: document.getElementById('calendarStyleLayout'),
+    fontPreset: document.getElementById('calendarStyleFontPreset'),
+    font: document.getElementById('calendarStyleFont'),
+    textRender: document.getElementById('calendarStyleTextRender'),
+    title: document.getElementById('calendarStyleTitle'),
+    accent: document.getElementById('calendarStyleAccent'),
+    lunar: document.getElementById('calendarStyleLunar'),
+    fontFile: document.getElementById('calendarStyleFontFile'),
+    render: document.getElementById('calendarStyleRender'),
+    send: document.getElementById('calendarStyleSend'),
+    reset: document.getElementById('calendarFontReset'),
+    sizes: {
+      title: document.getElementById('calendarFontTitle'),
+      mainDay: document.getElementById('calendarFontMainDay'),
+      weekday: document.getElementById('calendarFontWeekday'),
+      cellDay: document.getElementById('calendarFontCellDay'),
+      cellLunar: document.getElementById('calendarFontCellLunar')
+    }
+  };
+}
+
+function getCalendarStyleProfile() {
+  const mode = document.getElementById('ditherMode')?.value || 'fourColor';
+  return {
+    width: canvas?.width || 768,
+    height: canvas?.height || 552,
+    numericColorMode: mode === 'fourColor' ? 4 : (mode === 'threeColor' ? 3 : 2)
+  };
+}
+
+function getCalendarPreviewColors(profile) {
+  if (profile.numericColorMode === 4) return CALENDAR_PREVIEW_COLORS;
+  if (profile.numericColorMode === 3) return { ...CALENDAR_PREVIEW_COLORS, yellow: CALENDAR_PREVIEW_COLORS.white };
+  return { ...CALENDAR_PREVIEW_COLORS, red: CALENDAR_PREVIEW_COLORS.black, yellow: CALENDAR_PREVIEW_COLORS.white };
+}
+
+function getLunarInfo(date) {
+  try {
+    const parts = new Intl.DateTimeFormat('zh-CN-u-ca-chinese', {
+      year: 'numeric', month: 'long', day: 'numeric'
+    }).formatToParts(date);
+    const valueOf = (type) => parts.find((part) => part.type === type)?.value || '';
+    const dayNumber = parseInt(valueOf('day'), 10) || 1;
+    const relatedYear = parseInt(valueOf('relatedYear'), 10) || date.getFullYear();
+    const month = valueOf('month');
+    const day = LUNAR_DAY_NAMES[dayNumber] || String(dayNumber);
+    const zodiac = ZODIAC_NAMES[((relatedYear - 4) % 12 + 12) % 12];
+    return {
+      month,
+      day,
+      dayNumber,
+      dateText: `${month}${day}`,
+      yearText: `${valueOf('yearName')}${zodiac}年`
+    };
+  } catch (_) {
+    return { month: '', day: '', dayNumber: 0, dateText: '', yearText: '' };
+  }
+}
+
+function getNextSolarTerm(date) {
+  const terms = [
+    [0, 5, '小寒'], [0, 20, '大寒'], [1, 4, '立春'], [1, 19, '雨水'], [2, 5, '惊蛰'], [2, 20, '春分'],
+    [3, 4, '清明'], [3, 20, '谷雨'], [4, 5, '立夏'], [4, 21, '小满'], [5, 5, '芒种'], [5, 21, '夏至'],
+    [6, 7, '小暑'], [6, 23, '大暑'], [7, 7, '立秋'], [7, 23, '处暑'], [8, 7, '白露'], [8, 23, '秋分'],
+    [9, 8, '寒露'], [9, 23, '霜降'], [10, 7, '立冬'], [10, 22, '小雪'], [11, 7, '大雪'], [11, 21, '冬至']
+  ];
+  const today = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  for (const [month, day, name] of terms) {
+    const target = new Date(date.getFullYear(), month, day);
+    if (target >= today) return { name, days: Math.round((target - today) / 86400000) };
+  }
+  const target = new Date(date.getFullYear() + 1, terms[0][0], terms[0][1]);
+  return { name: terms[0][2], days: Math.round((target - today) / 86400000) };
+}
+
+function getIsoWeek(date) {
+  const target = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const day = target.getUTCDay() || 7;
+  target.setUTCDate(target.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(target.getUTCFullYear(), 0, 1));
+  return Math.ceil((((target - yearStart) / 86400000) + 1) / 7);
+}
+
+function getCalendarCellLabel(date) {
+  const festivals = {
+    '1-1': '元旦', '2-14': '情人节', '3-8': '妇女节', '5-1': '劳动节', '6-1': '儿童节',
+    '10-1': '国庆节', '12-25': '圣诞节'
+  };
+  const festival = festivals[`${date.getMonth() + 1}-${date.getDate()}`];
+  if (festival) return { text: festival, festival: true };
+  const lunar = getLunarInfo(date);
+  return { text: lunar.dayNumber === 1 ? lunar.month : lunar.day, festival: false };
+}
+
+function calendarRoundRect(context, x, y, width, height, radius) {
+  const r = Math.max(0, Math.min(radius, width / 2, height / 2));
+  context.beginPath();
+  context.moveTo(x + r, y);
+  context.lineTo(x + width - r, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + r);
+  context.lineTo(x + width, y + height - r);
+  context.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  context.lineTo(x + r, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - r);
+  context.lineTo(x, y + r);
+  context.quadraticCurveTo(x, y, x + r, y);
+  context.closePath();
+}
+
+function getCalendarStyleSettings() {
+  const elements = getCalendarStyleElements();
+  const sizes = {};
+  Object.entries(elements.sizes).forEach(([role, input]) => {
+    const value = Number(input?.value);
+    sizes[role] = Number.isFinite(value) ? value : CALENDAR_FONT_DEFAULTS[role];
+  });
+  return {
+    layout: elements.layout?.value || 'grid',
+    fontFamily: customCalendarFontFamily || elements.font?.value || 'Microsoft YaHei, SimHei, sans-serif',
+    textRender: elements.textRender?.value || 'smooth',
+    title: (elements.title?.value || '').trim(),
+    accent: elements.accent?.value || 'red',
+    showLunar: elements.lunar?.checked !== false,
+    sizes
+  };
+}
+
+function calendarStyleScale(profile) {
+  return Math.max(0.42, Math.min(profile.width / 768, profile.height / 552));
+}
+
+function calendarFontSize(settings, role, profile, multiplier = 1) {
+  return Math.max(7, Math.round((settings.sizes[role] || CALENDAR_FONT_DEFAULTS[role]) * calendarStyleScale(profile) * multiplier));
+}
+
+function drawCalendarText(context, text, x, y, options = {}) {
+  const value = String(text ?? '');
+  if (!value) return;
+  const settings = getCalendarStyleSettings();
+  const size = options.size || 24;
+  const weight = options.weight || 600;
+  context.save();
+  context.fillStyle = options.color || CALENDAR_PREVIEW_COLORS.black;
+  context.strokeStyle = options.strokeColor || context.fillStyle;
+  context.lineWidth = options.lineWidth || Math.max(1, Math.round(size / 22));
+  context.font = `${weight} ${size}px ${settings.fontFamily}`;
+  context.textAlign = options.align || 'left';
+  context.textBaseline = options.baseline || 'alphabetic';
+  if (settings.textRender === 'crisp') {
+    context.imageSmoothingEnabled = false;
+    if ('fontKerning' in context) context.fontKerning = 'none';
+    context.fillText(value, Math.round(x), Math.round(y));
+  } else if (settings.textRender === 'outline') {
+    context.strokeText(value, Math.round(x), Math.round(y));
+    context.fillText(value, Math.round(x), Math.round(y));
+  } else if (settings.textRender === 'pixelated' || settings.textRender === 'bold-pixel') {
+    const metrics = context.measureText(value);
+    const padding = Math.max(4, Math.ceil(size * 0.18));
+    const source = document.createElement('canvas');
+    source.width = Math.max(1, Math.ceil(metrics.width + padding * 2));
+    source.height = Math.max(1, Math.ceil(size * 1.45 + padding * 2));
+    const sourceContext = source.getContext('2d');
+    sourceContext.fillStyle = context.fillStyle;
+    sourceContext.strokeStyle = context.strokeStyle;
+    sourceContext.lineWidth = settings.textRender === 'bold-pixel' ? Math.max(1, Math.round(size / 18)) : 1;
+    sourceContext.font = context.font;
+    sourceContext.textBaseline = 'alphabetic';
+    const baseline = padding + size;
+    if (settings.textRender === 'bold-pixel') sourceContext.strokeText(value, padding, baseline);
+    sourceContext.fillText(value, padding, baseline);
+    const low = document.createElement('canvas');
+    const pixelScale = settings.textRender === 'bold-pixel' ? 0.42 : 0.5;
+    low.width = Math.max(1, Math.round(source.width * pixelScale));
+    low.height = Math.max(1, Math.round(source.height * pixelScale));
+    const lowContext = low.getContext('2d');
+    lowContext.imageSmoothingEnabled = true;
+    lowContext.drawImage(source, 0, 0, low.width, low.height);
+    let destX = x - padding;
+    if (context.textAlign === 'center') destX = x - source.width / 2;
+    else if (context.textAlign === 'right') destX = x - source.width + padding;
+    let destY = y - baseline;
+    if (context.textBaseline === 'middle') destY = y - source.height / 2;
+    else if (context.textBaseline === 'top') destY = y;
+    context.imageSmoothingEnabled = false;
+    context.drawImage(low, Math.round(destX), Math.round(destY), source.width, source.height);
+  } else {
+    context.fillText(value, x, y);
+  }
+  context.restore();
+}
+
+function getCalendarWeekdays(weekStart) {
+  const names = ['日', '一', '二', '三', '四', '五', '六'];
+  return Array.from({ length: 7 }, (_, index) => {
+    const day = (weekStart + index) % 7;
+    return { day, text: names[day], weekend: day === 0 || day === 6 };
+  });
+}
+
+function getCalendarAccent(profile, settings, colors) {
+  if (settings.accent === 'yellow') return profile.numericColorMode === 4 ? colors.yellow : colors.black;
+  if (settings.accent === 'black') return colors.black;
+  return colors.red;
+}
+
+function drawCalendarMonthGrid(context, date, profile, settings, bounds, options = {}) {
+  const colors = getCalendarPreviewColors(profile);
+  const accent = getCalendarAccent(profile, settings, colors);
+  const softAccent = profile.numericColorMode === 4 ? colors.yellow : colors.white;
+  const weekStart = Number(document.getElementById('weekStart')?.value) || 0;
+  const year = date.getFullYear();
+  const month = date.getMonth();
+  const firstOffset = (new Date(year, month, 1).getDay() - weekStart + 7) % 7;
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const rows = Math.ceil((firstOffset + daysInMonth) / 7);
+  const weekHeight = Math.max(22, Math.floor(bounds.height * 0.12));
+  const gridTop = bounds.y + weekHeight + 5;
+  const cellWidth = bounds.width / 7;
+  const cellHeight = Math.max(18, Math.floor((bounds.height - weekHeight - 5) / rows));
+  const numberSize = calendarFontSize(settings, 'cellDay', profile);
+  const labelSize = calendarFontSize(settings, 'cellLunar', profile);
+
+  getCalendarWeekdays(weekStart).forEach((weekday, index) => {
+    const x = bounds.x + index * cellWidth;
+    context.fillStyle = weekday.weekend ? accent : softAccent;
+    if (options.squareHeader) context.fillRect(x + 1, bounds.y, cellWidth - 2, weekHeight);
+    else {
+      calendarRoundRect(context, x + 2, bounds.y, cellWidth - 4, weekHeight, Math.min(8, weekHeight / 3));
+      context.fill();
+    }
+    drawCalendarText(context, weekday.text, x + cellWidth / 2, bounds.y + weekHeight * 0.7, {
+      size: Math.max(10, Math.round(calendarFontSize(settings, 'weekday', profile) * 0.7)),
+      weight: 800,
+      color: weekday.weekend ? colors.white : accent,
+      align: 'center'
+    });
+  });
+
+  context.strokeStyle = colors.black;
+  context.lineWidth = options.lineWidth || 2;
+  for (let row = 0; row <= rows; row++) {
+    const y = Math.round(gridTop + row * cellHeight);
+    context.beginPath();
+    context.moveTo(bounds.x, y);
+    context.lineTo(bounds.x + bounds.width, y);
+    context.stroke();
+  }
+  for (let col = 0; col <= 7; col++) {
+    const x = bounds.x + col * cellWidth;
+    context.beginPath();
+    context.moveTo(x, gridTop);
+    context.lineTo(x, gridTop + rows * cellHeight);
+    context.stroke();
+  }
+
+  for (let day = 1; day <= daysInMonth; day++) {
+    const position = firstOffset + day - 1;
+    const col = position % 7;
+    const row = Math.floor(position / 7);
+    const x = bounds.x + col * cellWidth;
+    const y = gridTop + row * cellHeight;
+    const actualWeekday = new Date(year, month, day).getDay();
+    const isToday = day === date.getDate();
+    if (isToday) {
+      context.fillStyle = softAccent;
+      calendarRoundRect(context, x + 5, y + 4, Math.max(8, cellWidth - 10), Math.max(8, cellHeight - 8), Math.min(9, cellHeight / 5));
+      context.fill();
+      context.strokeStyle = accent;
+      context.lineWidth = 2;
+      context.stroke();
+    }
+    const textX = x + cellWidth / 2;
+    const numberY = y + Math.min(cellHeight * 0.48, numberSize + 7);
+    drawCalendarText(context, day, textX, numberY, {
+      size: numberSize,
+      weight: isToday ? 900 : 800,
+      color: isToday || actualWeekday === 0 || actualWeekday === 6 ? accent : colors.black,
+      align: 'center'
+    });
+    if (settings.showLunar) {
+      const label = getCalendarCellLabel(new Date(year, month, day));
+      drawCalendarText(context, label.text, textX, Math.min(y + cellHeight - 5, numberY + labelSize + 3), {
+        size: labelSize,
+        weight: 700,
+        color: label.festival ? accent : colors.black,
+        align: 'center'
+      });
+    }
+  }
+}
+
+function drawFramedCalendarGrid(context, date, profile, settings, bounds, options = {}) {
+  const colors = getCalendarPreviewColors(profile);
+  const accent = getCalendarAccent(profile, settings, colors);
+  const padding = options.padding || Math.max(7, Math.round(12 * calendarStyleScale(profile)));
+  context.fillStyle = colors.white;
+  calendarRoundRect(context, bounds.x, bounds.y, bounds.width, bounds.height, options.radius || 12);
+  context.fill();
+  context.strokeStyle = options.stroke || accent;
+  context.lineWidth = options.strokeWidth || 2;
+  context.stroke();
+  drawCalendarMonthGrid(context, date, profile, settings, {
+    x: bounds.x + padding,
+    y: bounds.y + padding,
+    width: bounds.width - padding * 2,
+    height: bounds.height - padding * 2
+  }, options);
+}
+
+function drawCalendarStyle(context, date, profile) {
+  const settings = getCalendarStyleSettings();
+  const colors = getCalendarPreviewColors(profile);
+  const accent = getCalendarAccent(profile, settings, colors);
+  const softAccent = profile.numericColorMode === 4 ? colors.yellow : colors.white;
+  const { width, height } = profile;
+  const scale = calendarStyleScale(profile);
+  const pad = Math.max(12, Math.round(width * 0.035));
+  const monthText = `${date.getFullYear()}.${String(date.getMonth() + 1).padStart(2, '0')}`;
+  const weekdayText = `星期${getCalendarWeekdays(0)[date.getDay()].text}`;
+  const lunar = getLunarInfo(date);
+  const solarTerm = getNextSolarTerm(date);
+  const titleSize = calendarFontSize(settings, 'title', profile);
+  const mainDaySize = calendarFontSize(settings, 'mainDay', profile);
+  const weekdaySize = calendarFontSize(settings, 'weekday', profile);
+  const monthSize = Math.max(15, Math.round(24 * scale));
+  const lunarSize = Math.max(13, Math.round(22 * scale));
+  const smallSize = Math.max(11, Math.round(18 * scale));
+  context.fillStyle = colors.white;
+  context.fillRect(0, 0, width, height);
+
+  if (settings.layout === 'split') {
+    const leftWidth = Math.round(width * 0.36);
+    context.fillStyle = softAccent;
+    context.fillRect(0, 0, leftWidth, height);
+    context.fillStyle = accent;
+    context.fillRect(leftWidth - Math.max(4, Math.round(6 * scale)), 0, Math.max(4, Math.round(6 * scale)), height);
+    drawCalendarText(context, settings.title, pad, Math.round(48 * scale), { size: titleSize, weight: 850, color: colors.black });
+    drawCalendarText(context, date.getDate(), leftWidth / 2, height * 0.48, { size: Math.round(mainDaySize * 0.82), weight: 950, color: accent, align: 'center' });
+    drawCalendarText(context, weekdayText, leftWidth / 2, height * 0.62, { size: weekdaySize, weight: 800, color: colors.black, align: 'center' });
+    if (settings.showLunar) drawCalendarText(context, lunar.dateText, leftWidth / 2, height * 0.71, { size: lunarSize, weight: 700, color: accent, align: 'center' });
+    drawCalendarText(context, monthText, width - pad, Math.round(50 * scale), { size: monthSize, weight: 850, color: accent, align: 'right' });
+    drawCalendarMonthGrid(context, date, profile, settings, { x: leftWidth + pad, y: Math.round(78 * scale), width: width - leftWidth - pad * 2, height: height - Math.round(100 * scale) });
+    return;
+  }
+
+  if (settings.layout === 'dashboard') {
+    const sideWidth = Math.round(width * 0.3);
+    drawCalendarText(context, settings.title, pad, Math.round(42 * scale), { size: titleSize, weight: 850, color: colors.black });
+    drawCalendarText(context, monthText, width - pad, Math.round(42 * scale), { size: monthSize, weight: 850, color: accent, align: 'right' });
+    const cardY = Math.round(68 * scale);
+    const cardHeight = Math.round(150 * scale);
+    context.fillStyle = accent;
+    calendarRoundRect(context, pad, cardY, sideWidth, cardHeight, Math.round(16 * scale));
+    context.fill();
+    drawCalendarText(context, date.getDate(), pad + sideWidth / 2, cardY + cardHeight * 0.69, { size: Math.round(mainDaySize * 0.5), weight: 950, color: colors.white, align: 'center' });
+    drawCalendarText(context, weekdayText, pad + sideWidth / 2, cardY + cardHeight * 0.91, { size: Math.round(weekdaySize * 0.8), weight: 800, color: colors.white, align: 'center' });
+    const info = [['农历', lunar.dateText || '--'], ['周数', `${getIsoWeek(date)}周`], ['节气', solarTerm.days === 0 ? solarTerm.name : `${solarTerm.name}-${solarTerm.days}`]];
+    info.forEach((item, index) => {
+      const y = cardY + cardHeight + Math.round((32 + index * 58) * scale);
+      context.fillStyle = index % 2 === 0 ? softAccent : colors.white;
+      calendarRoundRect(context, pad, y, sideWidth, Math.round(42 * scale), Math.round(10 * scale));
+      context.fill();
+      drawCalendarText(context, item[0], pad + Math.round(14 * scale), y + Math.round(27 * scale), { size: Math.round(smallSize * 0.9), weight: 700, color: colors.black });
+      drawCalendarText(context, item[1], pad + sideWidth - Math.round(12 * scale), y + Math.round(27 * scale), { size: smallSize, weight: 850, color: accent, align: 'right' });
+    });
+    drawCalendarMonthGrid(context, date, profile, settings, { x: pad + sideWidth + Math.round(22 * scale), y: cardY, width: width - pad * 2 - sideWidth - Math.round(22 * scale), height: height - cardY - Math.round(24 * scale) }, { lineWidth: 2 });
+    return;
+  }
+
+  if (settings.layout === 'classic') {
+    const binderHeight = Math.round(72 * scale);
+    context.fillStyle = accent;
+    context.fillRect(0, 0, width, binderHeight);
+    context.fillStyle = colors.black;
+    for (let index = 0; index < 6; index++) {
+      const x = pad + Math.round(38 * scale) + index * ((width - pad * 2 - Math.round(76 * scale)) / 5);
+      context.beginPath();
+      context.arc(x, Math.round(18 * scale), Math.max(3, Math.round(6 * scale)), 0, Math.PI * 2);
+      context.fill();
+    }
+    drawCalendarText(context, settings.title, pad, Math.round(46 * scale), { size: titleSize, weight: 850, color: colors.white });
+    drawCalendarText(context, `${date.getFullYear()} 年 ${date.getMonth() + 1} 月`, width - pad, Math.round(46 * scale), { size: monthSize, weight: 850, color: colors.white, align: 'right' });
+    context.fillStyle = softAccent;
+    context.fillRect(0, binderHeight, width, Math.max(6, Math.round(12 * scale)));
+    drawFramedCalendarGrid(context, date, profile, settings, { x: pad, y: binderHeight + Math.round(24 * scale), width: width - pad * 2, height: height - binderHeight - Math.round(54 * scale) }, { squareHeader: true, lineWidth: 2, stroke: colors.black });
+    return;
+  }
+
+  if (settings.layout === 'duo') {
+    const leftWidth = Math.round(width * 0.34);
+    context.fillStyle = softAccent;
+    context.fillRect(0, 0, leftWidth, height);
+    context.fillStyle = accent;
+    context.fillRect(leftWidth - Math.max(5, Math.round(8 * scale)), 0, Math.max(5, Math.round(8 * scale)), height);
+    drawCalendarText(context, monthText, leftWidth / 2, pad + Math.round(36 * scale), { size: monthSize, weight: 850, color: accent, align: 'center' });
+    drawCalendarText(context, date.getDate(), leftWidth / 2, height * 0.52, { size: Math.round(mainDaySize * 0.72), weight: 950, color: colors.black, align: 'center' });
+    drawCalendarText(context, weekdayText, leftWidth / 2, height * 0.66, { size: weekdaySize, weight: 850, color: accent, align: 'center' });
+    if (settings.showLunar) drawCalendarText(context, lunar.dateText, leftWidth / 2, height * 0.76, { size: lunarSize, weight: 750, color: colors.black, align: 'center' });
+    drawFramedCalendarGrid(context, date, profile, settings, { x: leftWidth + pad, y: pad, width: width - leftWidth - pad * 2, height: height - pad * 2 }, { stroke: colors.black });
+    return;
+  }
+
+  const headerHeight = Math.max(Math.round(104 * scale), Math.round(height * 0.2));
+  context.fillStyle = softAccent;
+  calendarRoundRect(context, pad, pad, width - pad * 2, headerHeight, Math.round(22 * scale));
+  context.fill();
+  const dayWidth = Math.max(Math.round(98 * scale), Math.round(width * 0.18));
+  context.fillStyle = accent;
+  calendarRoundRect(context, pad + Math.round(14 * scale), pad + Math.round(14 * scale), dayWidth, headerHeight - Math.round(28 * scale), Math.round(16 * scale));
+  context.fill();
+  drawCalendarText(context, date.getDate(), pad + Math.round(width * 0.085), pad + headerHeight * 0.68, { size: Math.round(mainDaySize * 0.38), weight: 950, color: colors.white, align: 'center' });
+  drawCalendarText(context, settings.title || monthText, pad + Math.round(width * 0.21), pad + headerHeight * 0.58, { size: titleSize, weight: 850, color: colors.black });
+  drawFramedCalendarGrid(context, date, profile, settings, { x: pad, y: pad + headerHeight + Math.round(18 * scale), width: width - pad * 2, height: height - pad * 2 - headerHeight - Math.round(18 * scale) }, { stroke: colors.black, lineWidth: 2 });
+}
+
+function renderCalendarStylePreview() {
+  const elements = getCalendarStyleElements();
+  if (!elements.preview || !canvas) return false;
+  const profile = getCalendarStyleProfile();
+  if (elements.preview.width !== profile.width) elements.preview.width = profile.width;
+  if (elements.preview.height !== profile.height) elements.preview.height = profile.height;
+  elements.preview.style.aspectRatio = `${profile.width} / ${profile.height}`;
+  drawCalendarStyle(elements.preview.getContext('2d'), new Date(), profile);
+  return true;
+}
+
+function scheduleCalendarStylePreview() {
+  const panel = document.getElementById('calendarStylePanel');
+  if (!panel || panel.hidden) return;
+  clearTimeout(calendarStyleRenderTimer);
+  calendarStyleRenderTimer = setTimeout(renderCalendarStylePreview, 30);
+}
+
+function toggleCalendarStylePanel(forceOpen) {
+  const elements = getCalendarStyleElements();
+  if (!elements.panel) return;
+  const open = typeof forceOpen === 'boolean' ? forceOpen : elements.panel.hidden;
+  elements.panel.hidden = !open;
+  elements.toggle?.setAttribute('aria-expanded', open ? 'true' : 'false');
+  elements.toggle?.classList.toggle('primary', open);
+  elements.toggle?.classList.toggle('secondary', !open);
+  if (open) renderCalendarStylePreview();
+}
+
+async function applyCalendarStyleToImageCanvas(options = {}) {
+  const elements = getCalendarStyleElements();
+  if (!renderCalendarStylePreview()) return false;
+  const previewContext = elements.preview.getContext('2d');
+  const imageData = previewContext.getImageData(0, 0, elements.preview.width, elements.preview.height);
+  if (cropManager) cropManager.clearImage();
+  resetPaintForImageLoad();
+  ditherSourceImageData = cloneImageData(imageData);
+  ditherPreviewActive = true;
+  calendarStyleImageActive = true;
+  ctx.putImageData(imageData, 0, 0);
+  if (paintManager?.setBaseImageData) paintManager.setBaseImageData();
+  if (paintManager) {
+    paintManager.clearHistory();
+    paintManager.saveToHistory();
+  }
+  setCanvasTitle('日历风格');
+  setStatus(options.forSend ? '日历图片已生成，准备发送。' : '日历图片已生成到图片预览。');
+  addLog(options.forSend ? '日历图片已生成，开始发送。' : '日历图片已生成到图片预览。');
+  document.getElementById('image-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (options.forSend) return sendimg();
+  return true;
+}
+
+function updateCalendarFontOutput(input) {
+  const output = document.querySelector(`[data-size-value-for="${input.id}"]`);
+  if (output) output.textContent = `${input.value}px`;
+}
+
+function resetCalendarFontSizes() {
+  const elements = getCalendarStyleElements();
+  Object.entries(elements.sizes).forEach(([role, input]) => {
+    if (!input) return;
+    input.value = CALENDAR_FONT_DEFAULTS[role];
+    updateCalendarFontOutput(input);
+    updateRangeFill(input);
+  });
+  renderCalendarStylePreview();
+}
+
+function initCalendarStyleControls() {
+  const elements = getCalendarStyleElements();
+  if (!elements.panel) return;
+  const renderControls = [elements.layout, elements.textRender, elements.title, elements.accent, elements.lunar, ...Object.values(elements.sizes)];
+  renderControls.forEach((control) => {
+    if (!control) return;
+    const eventName = control.type === 'checkbox' || control.tagName === 'SELECT' ? 'change' : 'input';
+    control.addEventListener(eventName, () => {
+      if (control.type === 'range') updateCalendarFontOutput(control);
+      scheduleCalendarStylePreview();
+    });
+  });
+  elements.fontPreset?.addEventListener('change', () => {
+    if (elements.fontPreset.value !== 'custom') {
+      customCalendarFontFamily = '';
+      elements.font.value = elements.fontPreset.value;
+    }
+    renderCalendarStylePreview();
+  });
+  elements.font?.addEventListener('input', () => {
+    customCalendarFontFamily = '';
+    elements.fontPreset.value = 'custom';
+    scheduleCalendarStylePreview();
+  });
+  elements.fontFile?.addEventListener('change', async () => {
+    const file = elements.fontFile.files?.[0];
+    if (!file) return;
+    if (!('FontFace' in window)) {
+      addLog('当前浏览器不支持网页字体加载，请填写系统字体名。');
+      return;
+    }
+    const family = `CalendarCustomFont${Date.now()}`;
+    const url = URL.createObjectURL(file);
+    try {
+      const fontFace = new FontFace(family, `url(${url})`);
+      await fontFace.load();
+      document.fonts.add(fontFace);
+      customCalendarFontFamily = `"${family}", ${elements.font.value || 'sans-serif'}`;
+      elements.font.value = file.name.replace(/\.(ttf|otf|woff2?)$/i, '');
+      elements.fontPreset.value = 'custom';
+      renderCalendarStylePreview();
+      addLog('自定义日历字体已加载。');
+    } catch (error) {
+      addLog(`字体加载失败：${error.message || error}`);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  });
+  Object.values(elements.sizes).forEach((input) => input && updateCalendarFontOutput(input));
+  elements.reset?.addEventListener('click', resetCalendarFontSizes);
+  elements.render?.addEventListener('click', () => applyCalendarStyleToImageCanvas());
+  elements.send?.addEventListener('click', () => applyCalendarStyleToImageCanvas({ forSend: true }));
+  document.getElementById('weekStart')?.addEventListener('change', scheduleCalendarStylePreview);
 }
 
 function clampUiOpacity(value) {
@@ -2322,6 +2903,7 @@ function initRangeFill() {
 function initEventHandlers() {
   initGlobalNavActive();
   initRangeFill();
+  initCalendarStyleControls();
   updateDriverMeta();
   document.getElementById("clear-canvas").addEventListener("click", clearCanvas);
   const imageDropZone = document.getElementById('imageDropZone');

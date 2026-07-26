@@ -6,7 +6,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>墨水屏日历</title>
 	<link rel="shortcut icon" type="image/png" href="favicon.png">
-	<link rel="stylesheet" href="css/main.css?v=2026072401">
+	<link rel="stylesheet" href="css/main.css?v=2026072601">
 </head>
 
 <body>
@@ -88,11 +88,107 @@
 					</select>
 					<button id="calendarmodebutton" type="button" class="primary" onclick="syncTime(1)">日历模式</button>
 					<button id="clockmodebutton" type="button" class="primary" onclick="syncTime(2)">时钟模式</button>
+					<button id="calendarstylebutton" type="button" class="secondary" onclick="toggleCalendarStylePanel()" aria-expanded="false" aria-controls="calendarStylePanel">日历风格</button>
 					<button id="clearscreenbutton" type="button" class="secondary" onclick="clearScreen()">清除屏幕</button>
 				</div>
 				<div class="flex-group right debug">
 					<input type="text" id="cmdTXT" value="">
 					<button id="sendcmdbutton" type="button" class="primary" onclick="sendcmd()">发送命令</button>
+				</div>
+			</div>
+			<div id="calendarStylePanel" class="calendar-style-panel" hidden>
+				<div class="calendar-style-workspace">
+					<div class="calendar-style-preview-wrap">
+						<div class="calendar-style-section-title">日历预览</div>
+						<div class="calendar-style-preview-frame">
+							<canvas id="calendarStylePreview" width="768" height="552" aria-label="日历风格预览"></canvas>
+						</div>
+					</div>
+					<div class="calendar-style-controls">
+						<div class="calendar-style-section-title">日历样式</div>
+						<div class="calendar-style-grid">
+							<label class="calendar-input-group">
+								<span>布局</span>
+								<select id="calendarStyleLayout">
+									<option value="grid" selected>月历网格</option>
+									<option value="split">左日右历</option>
+									<option value="dashboard">信息仪表盘</option>
+									<option value="classic">台历经典</option>
+									<option value="duo">双挂日历</option>
+								</select>
+							</label>
+							<label class="calendar-input-group">
+								<span>字体预设</span>
+								<select id="calendarStyleFontPreset">
+									<option value="Microsoft YaHei, sans-serif" selected>微软雅黑</option>
+									<option value="SimHei, sans-serif">黑体</option>
+									<option value="SimSun, Songti SC, serif">宋体</option>
+									<option value="KaiTi, Kaiti SC, serif">楷体</option>
+									<option value="FangSong, STFangsong, serif">仿宋</option>
+									<option value="DengXian, sans-serif">等线</option>
+									<option value="'Source Han Sans SC', 'Noto Sans CJK SC', sans-serif">思源黑体</option>
+									<option value="'LXGW WenKai', KaiTi, serif">霞鹜文楷</option>
+									<option value="custom">自定义/上传字体</option>
+								</select>
+							</label>
+							<label class="calendar-input-group">
+								<span>文字渲染</span>
+								<select id="calendarStyleTextRender">
+									<option value="smooth" selected>平滑字体</option>
+									<option value="crisp">硬边清晰</option>
+									<option value="pixelated">像素化近似点阵</option>
+									<option value="bold-pixel">粗像素黑白</option>
+									<option value="outline">细描边强化</option>
+								</select>
+							</label>
+							<label class="calendar-input-group">
+								<span>标题</span>
+								<input type="text" id="calendarStyleTitle" maxlength="16" placeholder="可选标题">
+							</label>
+							<label class="calendar-input-group">
+								<span>强调色</span>
+								<select id="calendarStyleAccent">
+									<option value="red" selected>红色</option>
+									<option value="yellow">黄色</option>
+									<option value="black">黑色</option>
+								</select>
+							</label>
+							<label class="calendar-input-group calendar-style-check">
+								<input type="checkbox" id="calendarStyleLunar" checked>
+								<span>显示农历/节气</span>
+							</label>
+						</div>
+						<details class="calendar-advanced-settings">
+							<summary>高级字体设置</summary>
+							<div class="calendar-advanced-grid">
+								<label class="calendar-input-group">
+									<span>自定义字体</span>
+									<input type="text" id="calendarStyleFont" value="Microsoft YaHei, SimHei, sans-serif" placeholder="例如：思源黑体, 宋体">
+								</label>
+								<label class="calendar-input-group">
+									<span>上传字体文件</span>
+									<input type="file" id="calendarStyleFontFile" accept=".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2">
+								</label>
+							</div>
+						</details>
+						<div class="calendar-style-size-section">
+							<div class="calendar-style-size-header">
+								<div class="calendar-style-section-title">字号调节</div>
+								<button id="calendarFontReset" class="secondary" type="button">重置字号</button>
+							</div>
+							<div class="calendar-size-grid">
+								<label class="calendar-size-control"><span>标题</span><input type="range" id="calendarFontTitle" min="8" max="180" value="28"><output data-size-value-for="calendarFontTitle">28px</output></label>
+								<label class="calendar-size-control"><span>主日期数字</span><input type="range" id="calendarFontMainDay" min="24" max="260" value="170"><output data-size-value-for="calendarFontMainDay">170px</output></label>
+								<label class="calendar-size-control"><span>星期</span><input type="range" id="calendarFontWeekday" min="8" max="180" value="28"><output data-size-value-for="calendarFontWeekday">28px</output></label>
+								<label class="calendar-size-control"><span>月历数字</span><input type="range" id="calendarFontCellDay" min="8" max="120" value="24"><output data-size-value-for="calendarFontCellDay">24px</output></label>
+								<label class="calendar-size-control"><span>月历农历</span><input type="range" id="calendarFontCellLunar" min="8" max="80" value="13"><output data-size-value-for="calendarFontCellLunar">13px</output></label>
+							</div>
+						</div>
+						<div class="calendar-style-actions">
+							<button id="calendarStyleRender" class="secondary" type="button">生成到图片预览</button>
+							<button id="calendarStyleSend" class="primary" type="button" disabled>生成并发送到设备</button>
+						</div>
+					</div>
 				</div>
 			</div>
 		</fieldset>
@@ -179,28 +275,6 @@
 					<button id="resetDitherAdjustments" type="button" class="secondary">还原默认</button>
 				</div>
 			</div>
-			<div class="flex-container options dither-adjust-row">
-				<div class="flex-group">
-					<label for="ditherStrength">抖动强度:</label>
-					<input type="range" min="0" max="5" step="0.1" value="1.0" id="ditherStrength">
-					<label id="ditherStrengthValue">1.0</label>
-				</div>
-				<div class="flex-group">
-					<label for="ditherContrast">对比度:</label>
-					<input type="range" min="0.5" max="2" step="0.1" value="1.2" id="ditherContrast">
-					<label id="ditherContrastValue">1.2</label>
-				</div>
-				<div class="flex-group">
-					<label for="ditherBrightness">亮度:</label>
-					<input type="range" min="-80" max="80" step="1" value="0" id="ditherBrightness">
-					<label id="ditherBrightnessValue">0</label>
-				</div>
-				<div class="flex-group">
-					<label for="ditherSaturation">饱和度:</label>
-					<input type="range" min="0" max="2.5" step="0.1" value="1.2" id="ditherSaturation">
-					<label id="ditherSaturationValue">1.2</label>
-				</div>
-			</div>
 			<div class="flex-container options">
 				<div class="flex-group debug">
 					<label for="mtusize">MTU:</label>
@@ -223,6 +297,28 @@
 			<div class="canvas-container">
 				<div class="canvas-title"></div>
 				<canvas id="canvas" width="768" height="552"></canvas>
+				<div class="flex-container options dither-adjust-row">
+					<div class="flex-group">
+						<label for="ditherStrength">抖动强度:</label>
+						<input type="range" min="0" max="5" step="0.1" value="1.0" id="ditherStrength">
+						<label id="ditherStrengthValue">1.0</label>
+					</div>
+					<div class="flex-group">
+						<label for="ditherContrast">对比度:</label>
+						<input type="range" min="0.5" max="2" step="0.1" value="1.2" id="ditherContrast">
+						<label id="ditherContrastValue">1.2</label>
+					</div>
+					<div class="flex-group">
+						<label for="ditherBrightness">亮度:</label>
+						<input type="range" min="-80" max="80" step="1" value="0" id="ditherBrightness">
+						<label id="ditherBrightnessValue">0</label>
+					</div>
+					<div class="flex-group">
+						<label for="ditherSaturation">饱和度:</label>
+						<input type="range" min="0" max="2.5" step="0.1" value="1.2" id="ditherSaturation">
+						<label id="ditherSaturationValue">1.2</label>
+					</div>
+				</div>
 				<div class="flex-container canvas-tools">
 					<div class="flex-group tool-buttons">
 						<button id="brush-mode" title="画笔" class="tool-button">✏️</button>
@@ -483,7 +579,7 @@
 	<script type="text/javascript" src="js/dithering.js?v=2026070702"></script>
 	<script type="text/javascript" src="js/paint.js?v=2026072301"></script>
 	<script type="text/javascript" src="js/crop.js?v=2026072302"></script>
-	<script type="text/javascript" src="js/main.js?v=2026072402"></script>
+	<script type="text/javascript" src="js/main.js?v=2026072603"></script>
 </body>
 
 </html>
