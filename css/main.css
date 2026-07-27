@@ -29,6 +29,61 @@
     --page-bg-overlay-opacity: 0.22;
 }
 
+.ota-row,
+.ota-progress-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+}
+
+.ota-panel {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--hairline);
+}
+
+.ota-panel[hidden] {
+    display: none;
+}
+
+.ota-row input[type=file] {
+    flex: 1 1 280px;
+    min-width: 0;
+}
+
+.ota-progress-row {
+    margin-top: 12px;
+}
+
+#otaProgress {
+    flex: 0 1 360px;
+    width: min(42vw, 360px);
+    height: 10px;
+    accent-color: var(--primary-color);
+}
+
+#otaStatus {
+    min-width: 0;
+    color: var(--body-muted);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 560px) {
+    .ota-row,
+    .ota-progress-row {
+        align-items: stretch;
+        flex-wrap: wrap;
+    }
+
+    .ota-row input[type=file],
+    #otaProgress {
+        flex: 1 1 100%;
+        width: 100%;
+    }
+}
+
 .calendar-style-panel {
     padding-top: 18px;
     border-top: 1px solid var(--hairline);

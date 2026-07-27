@@ -6,7 +6,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>墨水屏日历</title>
 	<link rel="shortcut icon" type="image/png" href="favicon.png">
-	<link rel="stylesheet" href="css/main.css?v=2026072601">
+	<link rel="stylesheet" href="css/main.css?v=2026072703">
 </head>
 
 <body>
@@ -33,6 +33,7 @@
 					<button id="connectbutton" type="button" class="primary" onclick="preConnect()">连接</button>
 					<button id="reconnectbutton" type="button" class="secondary" onclick="reConnect()">重连</button>
 					<button type="button" class="secondary" onclick="clearLog()">清空日志</button>
+					<button id="otaPanelToggle" type="button" class="secondary" onclick="toggleOtaPanel()" aria-expanded="false" aria-controls="ota-panel">固件升级</button>
 					<label class="led-switch" for="ledEnabled" title="开启或关闭设备状态指示灯">
 						<span>LED</span>
 						<input id="ledEnabled" type="checkbox" role="switch" onchange="setLedEnabled()" checked disabled>
@@ -48,6 +49,7 @@
 						<option value="01" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, UC8176)</option>
 						<option value="03" data-color="threeColor" data-size="4.2_400_300">4.2寸 (三色, UC8176)</option>
 						<option value="04" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1619)</option>
+						<option value="17" data-color="blackWhiteColor" data-size="4.2_400_300">4.2寸 (黑白, SSD1683)</option>
 						<option value="02" data-color="threeColor" data-size="4.2_400_300">4.2寸 (三色, SSD1619)</option>
 						<option value="05" data-color="fourColor" data-size="4.2_400_300">4.2寸 (四色, JCF)</option>
 						<option value="16" data-color="fourColor" data-size="4.2_400_300">4.2寸 (四色, JD79668)</option>
@@ -71,6 +73,18 @@
 				</div>
 			</div>
 			<div class="log-container" id="log"></div>
+			<div id="ota-panel" class="ota-panel" hidden>
+				<div class="ota-row">
+					<input id="otaFile" type="file" accept=".zip,application/zip" onchange="updateOtaFileState()">
+					<button id="otaEnterButton" type="button" class="primary" onclick="enterOtaBootloader()" disabled>OTA 升级</button>
+					<button id="otaUploadButton" type="button" class="secondary" onclick="startOtaUpdate()" disabled>选择 DfuTarg 继续升级</button>
+					<button id="otaCancelButton" type="button" class="secondary" onclick="cancelOtaUpdate()" disabled>取消</button>
+				</div>
+				<div class="ota-progress-row">
+					<progress id="otaProgress" max="100" value="0"></progress>
+					<span id="otaStatus" role="status" aria-live="polite">请选择 EPD-nRF52-ota.zip。</span>
+				</div>
+			</div>
 		</fieldset>
 		<fieldset id="device-panel">
 			<legend>模式切换</legend>
@@ -579,7 +593,8 @@
 	<script type="text/javascript" src="js/dithering.js?v=2026070702"></script>
 	<script type="text/javascript" src="js/paint.js?v=2026072301"></script>
 	<script type="text/javascript" src="js/crop.js?v=2026072302"></script>
-	<script type="text/javascript" src="js/main.js?v=2026072603"></script>
+	<script type="text/javascript" src="js/secure-dfu.js?v=2026072703"></script>
+	<script type="text/javascript" src="js/main.js?v=2026072704"></script>
 </body>
 
 </html>

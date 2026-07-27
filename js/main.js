@@ -22,6 +22,11 @@ let slotActionTimer = null;
 let slotReadTimer = null;
 let slotEraseAllPending = false;
 let displayErrorActive = false;
+let otaPackage = null;
+let otaClient = null;
+let otaBusy = false;
+let otaPhase = 'idle';
+let otaNextLogPercent = 10;
 let customCalendarFontFamily = '';
 let calendarStyleRenderTimer = null;
 let calendarStyleImageActive = false;
@@ -74,7 +79,7 @@ const EpdCmd = {
 
   SET_TIME: 0x20,
   SET_WEEK_START: 0x21,
-  SET_LED: 0x22,
+  SET_LED: 0x93,
 
   WRITE_IMG: 0x30, // v1.6
   SET_SLOT: 0x31,
@@ -217,7 +222,12 @@ async function write(cmd, data, withResponse = true) {
     payload.push(...data)
   }
   const isSlotChunkRequest = cmd === EpdCmd.GET_IMAGE && payload.length === 4;
-  if (cmd !== EpdCmd.WRITE_IMG && !isSlotChunkRequest) addLog(bytes2hex(payload), '⇑');
+  if (cmd !== EpdCmd.WRITE_IMG && !isSlotChunkRequest) {
+    const logPayload = cmd === EpdCmd.SET_LED
+      ? payload.map(value => value.toString(16).padStart(2, '0')).join(' ')
+      : bytes2hex(payload);
+    addLog(logPayload, '⇑');
+  }
   try {
     await queueBleWrite(() => writeGattPayload(payload, withResponse));
   } catch (e) {
@@ -236,6 +246,136 @@ function formatSlotBytes(size) {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function setOtaStatus(message, progress = null) {
+  const status = document.getElementById('otaStatus');
+  const progressBar = document.getElementById('otaProgress');
+  if (status) status.textContent = message;
+  if (progressBar && progress != null) progressBar.value = Math.max(0, Math.min(100, progress));
+}
+
+function toggleOtaPanel() {
+  const panel = document.getElementById('ota-panel');
+  const toggle = document.getElementById('otaPanelToggle');
+  if (!panel || !toggle || otaBusy) return;
+  const open = panel.hidden;
+  panel.hidden = !open;
+  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function updateOtaControls() {
+  const file = document.getElementById('otaFile');
+  const enter = document.getElementById('otaEnterButton');
+  const upload = document.getElementById('otaUploadButton');
+  const cancel = document.getElementById('otaCancelButton');
+  const toggle = document.getElementById('otaPanelToggle');
+  if (!file || !enter || !upload || !cancel || !toggle) return;
+
+  const connected = gattServer != null && gattServer.connected;
+  const displayBusy = imageTransferActive || imageRefreshPending || slotActionPending || slotReadState !== null;
+  file.disabled = otaBusy;
+  enter.disabled = otaBusy || displayBusy || !otaPackage || !connected;
+  upload.disabled = otaBusy || !otaPackage || connected;
+  cancel.disabled = !otaBusy || otaClient == null;
+  toggle.disabled = otaBusy;
+}
+
+async function updateOtaFileState() {
+  const input = document.getElementById('otaFile');
+  const file = input && input.files ? input.files[0] : null;
+  otaPackage = null;
+  otaPhase = 'idle';
+  setOtaStatus(file ? '正在校验升级包...' : '请选择 EPD-nRF52-ota.zip。', 0);
+  updateOtaControls();
+  if (!file) return;
+
+  try {
+    otaPackage = await SecureDfu.parsePackage(file);
+    setOtaStatus(`${file.name} · ${formatSlotBytes(otaPackage.firmware.length)} · CRC32 ${otaPackage.firmwareCrc.toString(16).padStart(8, '0').toUpperCase()}`, 0);
+    addLog(`OTA 包校验通过：${otaPackage.firmware.length} 字节。`);
+  } catch (error) {
+    input.value = '';
+    setOtaStatus(error.message || '升级包校验失败。', 0);
+    addLog(error.message || '升级包校验失败。', '', 'error');
+  }
+  updateOtaControls();
+}
+
+async function enterOtaBootloader() {
+  if (!otaPackage || otaBusy || !isBleConnected()) return;
+  if (!confirm(`确认一键升级当前设备？\n升级包：${otaPackage.name}`)) return;
+
+  let autoUpload = false;
+  otaBusy = true;
+  otaPhase = 'entering';
+  setOtaStatus('正在切换到 DfuTarg...', 0);
+  addLog('正在让设备进入原厂 Secure DFU 模式...');
+  updateButtonStatus();
+  try {
+    await SecureDfu.enterBootloader(bleDevice);
+    otaPhase = 'bootloader';
+    setOtaStatus('DfuTarg 已启动，正在自动连接...', 0);
+    addLog('设备已进入 DfuTarg，正在自动继续升级。');
+    autoUpload = true;
+  } catch (error) {
+    otaPhase = 'idle';
+    setOtaStatus(error.message || '进入升级模式失败。', 0);
+    addLog(error.message || '进入升级模式失败。', '', 'error');
+  } finally {
+    otaBusy = false;
+    updateButtonStatus();
+  }
+  if (autoUpload) await startOtaUpdate(true);
+}
+
+async function startOtaUpdate(grantedOnly = false) {
+  if (!otaPackage || otaBusy || isBleConnected()) return;
+  if (!grantedOnly && !confirm(`确认升级 ${otaPackage.name}？\n升级过程中请保持页面和蓝牙开启。`)) return;
+
+  otaBusy = true;
+  otaPhase = 'uploading';
+  otaNextLogPercent = 10;
+  setOtaStatus(grantedOnly ? '正在自动连接 DfuTarg...' : '请选择 DfuTarg 设备...', 0);
+  addLog(grantedOnly ? '正在自动连接已授权的 DfuTarg...' : '正在搜索 DfuTarg...');
+  otaClient = new SecureDfu.Client(otaPackage, {
+    status: message => setOtaStatus(message),
+    progress: (progress, message) => {
+      const percent = Math.floor(progress);
+      setOtaStatus(message, percent);
+      if (percent >= otaNextLogPercent || percent === 100) {
+        addLog(`OTA 传输进度：${percent}%`, '⇑');
+        while (otaNextLogPercent <= percent) otaNextLogPercent += 10;
+      }
+    }
+  });
+  updateButtonStatus();
+
+  try {
+    await otaClient.upload({ grantedOnly });
+    otaPhase = 'complete';
+    setOtaStatus('升级完成，设备正在重启。', 100);
+    addLog('OTA 校验和安装已完成，设备正在重启。');
+  } catch (error) {
+    const cancelled = otaClient && otaClient.cancelled;
+    const permissionRequired = error && error.name === 'DfuPermissionRequired';
+    otaPhase = permissionRequired ? 'bootloader' : (cancelled ? 'cancelled' : 'failed');
+    const message = permissionRequired ? error.message : (cancelled ? 'OTA 已取消。' : (error.message || 'OTA 升级失败。'));
+    setOtaStatus(message, 0);
+    addLog(message, '', cancelled || permissionRequired ? '' : 'error');
+  } finally {
+    otaClient = null;
+    otaBusy = false;
+    updateButtonStatus();
+  }
+}
+
+function cancelOtaUpdate() {
+  if (!otaClient || !otaBusy) return;
+  otaPhase = 'cancelling';
+  setOtaStatus('正在取消 OTA...');
+  otaClient.cancel();
+  updateOtaControls();
 }
 
 function slotColorName(colorId) {
@@ -1503,9 +1643,10 @@ function downloadDataArray() {
   URL.revokeObjectURL(link.href);
 }
 
-function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPending || slotReadState !== null) {
+function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPending || slotReadState !== null || otaBusy) {
   const connected = gattServer != null && gattServer.connected;
   const status = forceDisabled ? 'disabled' : (connected ? null : 'disabled');
+  document.getElementById("connectbutton").disabled = otaBusy;
   document.getElementById("reconnectbutton").disabled = (gattServer == null || gattServer.connected) ? 'disabled' : null;
   document.getElementById("sendcmdbutton").disabled = status;
   document.getElementById("calendarmodebutton").disabled = status;
@@ -1521,16 +1662,23 @@ function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPen
   document.getElementById("startSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
   document.getElementById("randomSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
   document.getElementById("stopSlotSlideButton").disabled = status;
+  updateOtaControls();
   renderSlotGrid(forceDisabled);
 }
 
 function finishDisconnect(message = '已断开连接.') {
   const hadConnectionState = gattServer || epdService || epdCharacteristic ||
     (bleDevice && bleDevice.gatt && bleDevice.gatt.connected);
+  const enteringOta = otaPhase === 'entering';
   resetVariables({ clearLog: false });
   document.getElementById("connectbutton").innerHTML = '连接';
   updateButtonStatus();
-  if (message && hadConnectionState) addLog(message);
+  if (enteringOta && hadConnectionState) {
+    setOtaStatus('设备正在启动 DfuTarg...', 0);
+    addLog('应用连接已断开，正在启动 DfuTarg。');
+  } else if (message && hadConnectionState) {
+    addLog(message);
+  }
 }
 
 function disconnect() {
@@ -1559,6 +1707,7 @@ function disconnectDeviceOnPageExit() {
 
   const device = bleDevice;
   try {
+    if (otaClient) otaClient.cancel();
     if (device && device.gatt && device.gatt.connected) {
       device.gatt.disconnect();
     }
@@ -1603,7 +1752,7 @@ async function preConnect() {
           { services: [EPD_SERVICE_UUID] },
           { namePrefix: 'NRF_EPD' }
         ],
-        optionalServices: [EPD_SERVICE_UUID]
+        optionalServices: [EPD_SERVICE_UUID, SecureDfu.DFU_SERVICE_UUID]
       });
     } catch (e) {
       console.error(e);
@@ -1736,11 +1885,11 @@ async function connect() {
   }
 
   if (appVersion < 0x16) {
-    const oldURL = "https://tsl0922.github.io/EPD-nRF5/v1.5";
+    const onlineURL = "https://jcf12348.github.io/epd/";
     alert("!!!注意!!!\n当前固件版本过低，可能无法正常使用部分功能，建议升级到最新版本。");
-    if (confirm('是否访问旧版本上位机？')) location.href = oldURL;
+    if (confirm('是否访问在线上位机？')) location.href = onlineURL;
     setTimeout(() => {
-      addLog(`如遇到问题，可访问旧版本上位机: ${oldURL}`);
+      addLog(`如遇到问题，可访问在线上位机: ${onlineURL}`);
     }, 500);
   }
 
