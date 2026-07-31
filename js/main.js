@@ -1,6 +1,6 @@
 ﻿let bleDevice, gattServer;
 let epdService, epdCharacteristic;
-let startTime, msgIndex, appVersion;
+let startTime, msgIndex;
 let canvas, ctx, textDecoder;
 let paintManager, cropManager;
 let bleWriteChain = Promise.resolve();
@@ -14,9 +14,11 @@ let slotImageCache = new Map();
 let slotImageCacheScope = '';
 let slotPreviewPending = new Set();
 let rleSupport = false;
+let slotStreamSupport = false;
 let imageTransferActive = false;
 let imageRefreshPending = false;
 let imageRefreshTimer = null;
+let imageCompletionKind = 'refresh';
 let slotActionPending = false;
 let slotActionTimer = null;
 let slotReadTimer = null;
@@ -27,9 +29,11 @@ let otaClient = null;
 let otaBusy = false;
 let otaPhase = 'idle';
 let otaNextLogPercent = 10;
+let reconnectActive = false;
 let customCalendarFontFamily = '';
 let calendarStyleRenderTimer = null;
 let calendarStyleImageActive = false;
+let ledColorWriteTimer = null;
 
 const MAX_SLOT_IMAGE_SIZE = 1024 * 1024;
 const DEFAULT_SLOT_READ_RAW_CHUNK_SIZE = 256;
@@ -40,6 +44,9 @@ const IMAGE_REFRESH_TIMEOUT_MS = 95000;
 const SLOT_IMAGE_CACHE_PREFIX = 'epd-slot-preview-v2:';
 const SLOT_PREVIEW_MAX_EDGE = 480;
 const SLOT_PREVIEW_JPEG_QUALITY = 0.88;
+const RECONNECT_MAX_ATTEMPTS = 3;
+const RECONNECT_RETRY_DELAY_MS = 600;
+const LED_COLOR_WRITE_DELAY_MS = 100;
 
 const PAGE_BACKGROUND_STORAGE_KEY = 'epdCustomPageBackground';
 const PAGE_BACKGROUND_SETTINGS_STORAGE_KEY = 'epdCustomPageBackgroundSettings';
@@ -94,15 +101,17 @@ const EpdCmd = {
   CFG_ERASE: 0x99,
 };
 
-const LEGACY_EPD_CONFIG_SIZES = [14, 15];
-const EPD_CONFIG_SIZE = 16;
+const LEGACY_EPD_CONFIG_SIZES = [14, 15, 16];
+const EPD_CONFIG_SIZE = 19;
 const LED_CONTROL_MIN_VERSION = 0x40;
+let firmwareVersion = { label: '未知', ledControl: false, outdated: true };
 
 const canvasSizes = [
   { name: '1.54_152_152', width: 152, height: 152 },
   { name: '1.54_200_200', width: 200, height: 200 },
   { name: '2.13_212_104', width: 212, height: 104 },
   { name: '2.13_250_122', width: 250, height: 122 },
+  { name: '2.13_128_250', width: 128, height: 250 },
   { name: '2.66_296_152', width: 296, height: 152 },
   { name: '2.9_296_128', width: 296, height: 128 },
   { name: '2.9_384_168', width: 384, height: 168 },
@@ -140,6 +149,25 @@ function bytes2hex(data) {
     }, "");
 }
 
+function parseFirmwareVersion(value) {
+  const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  const text = new TextDecoder().decode(bytes).replace(/\0+$/, '');
+  const semantic = /^V(\d+)\.(\d+)$/.exec(text);
+  if (semantic) {
+    const major = parseInt(semantic[1], 10);
+    const minor = parseInt(semantic[2], 10);
+    const currentOrNewer = major > 1 || (major === 1 && minor >= 8);
+    return { label: text, ledControl: currentOrNewer, outdated: !currentOrNewer };
+  }
+
+  const legacy = bytes.length > 0 ? bytes[0] : 0;
+  return {
+    label: `0x${legacy.toString(16)}`,
+    ledControl: legacy >= LED_CONTROL_MIN_VERSION,
+    outdated: legacy < 0x16,
+  };
+}
+
 function intToHex(intIn) {
   let stringOut = ("0000" + intIn.toString(16)).substr(-4)
   return stringOut.substring(2, 4) + stringOut.substring(0, 2);
@@ -150,7 +178,7 @@ function resetVariables(options = {}) {
   gattServer = null;
   epdService = null;
   epdCharacteristic = null;
-  appVersion = null;
+  firmwareVersion = { label: '未知', ledControl: false, outdated: true };
   msgIndex = 0;
   bleWriteChain = Promise.resolve();
   currentPinsValue = '';
@@ -162,8 +190,10 @@ function resetVariables(options = {}) {
   slotImageCacheScope = '';
   slotPreviewPending = new Set();
   rleSupport = false;
+  slotStreamSupport = false;
   imageTransferActive = false;
   imageRefreshPending = false;
+  imageCompletionKind = 'refresh';
   if (imageRefreshTimer != null) clearTimeout(imageRefreshTimer);
   imageRefreshTimer = null;
   slotActionPending = false;
@@ -717,7 +747,7 @@ function renderSlotGrid(forceDisabled = imageTransferActive || slotActionPending
   }
 
   summary.textContent = `${slotState.count} 个槽位，已使用 ${usedCount} 个`;
-  hint.textContent = '“存入”会同时刷新屏幕并保存当前画布';
+  hint.textContent = '“存入”仅保存到设备，不刷新屏幕';
 }
 
 async function refreshSlots() {
@@ -775,7 +805,8 @@ async function saveImageToSlot(slot) {
   }
   const used = (slotState.usedMask & (1 << slot)) !== 0;
   if (used && !confirm(`槽位 ${slot + 1} 已有图片，确认覆盖？`)) return;
-  await sendimg({ slot });
+  const refreshAfterSave = document.getElementById('slotRefreshAfterSave').checked;
+  await sendimg({ slot, refreshAfterSave });
 }
 
 async function freeImageSlot(slot) {
@@ -841,8 +872,9 @@ function cancelImageRefreshWait() {
   imageRefreshPending = false;
 }
 
-function startImageRefreshWait() {
+function startImageRefreshWait(kind = 'refresh') {
   cancelImageRefreshWait();
+  imageCompletionKind = kind;
   imageRefreshPending = true;
   imageRefreshTimer = setTimeout(() => {
     if (!imageRefreshPending) return;
@@ -850,8 +882,9 @@ function startImageRefreshWait() {
     imageRefreshTimer = null;
     imageTransferActive = false;
     updateButtonStatus();
-    setStatus('屏幕刷新完成通知超时。');
-    addLog('屏幕刷新完成通知超时，控制按钮已恢复；请确认屏幕已停止刷新后再操作。');
+    const action = imageCompletionKind === 'slot' ? '槽位保存' : '屏幕刷新';
+    setStatus(`${action}完成通知超时。`);
+    addLog(`${action}完成通知超时，控制按钮已恢复。`);
   }, IMAGE_REFRESH_TIMEOUT_MS);
 }
 
@@ -862,8 +895,10 @@ function completeImageRefresh() {
   imageTransferActive = false;
   updateButtonStatus();
   const totalTime = (new Date().getTime() - startTime) / 1000.0;
-  setStatus(`屏幕刷新完成！总耗时: ${totalTime}s`);
-  addLog(`屏幕刷新完成，可以继续操作。总耗时: ${totalTime}s`);
+  const action = imageCompletionKind === 'slot' ? '槽位保存' : '屏幕刷新';
+  setStatus(`${action}完成！总耗时: ${totalTime}s`);
+  addLog(`${action}完成，可以继续操作。总耗时: ${totalTime}s`);
+  imageCompletionKind = 'refresh';
   const status = document.getElementById('status');
   setTimeout(() => {
     status.parentElement.style.display = 'none';
@@ -978,8 +1013,26 @@ function armSlotChunkTimeout(index) {
   clearSlotReadTimer();
   const state = slotReadState;
   slotReadTimer = setTimeout(() => {
-    if (slotReadState === state) retrySlotChunk(index, '接收超时');
+    if (slotReadState !== state) return;
+    if (state.streaming) {
+      failSlotImageRead(`连续读取第 ${index + 1} 个数据块超时，请重试。`);
+    } else {
+      retrySlotChunk(index, '接收超时');
+    }
   }, SLOT_READ_TIMEOUT_MS);
+}
+
+async function startSlotImageStream() {
+  const state = slotReadState;
+  if (!state || state.pending) return;
+
+  state.streaming = true;
+  state.nextChunkIndex = 0;
+  state.expectedChunk = null;
+  armSlotChunkTimeout(0);
+  if (!await write(EpdCmd.GET_IMAGE, new Uint8Array([state.slot, 1]), false) && slotReadState === state) {
+    failSlotImageRead('连续读取命令发送失败。');
+  }
 }
 
 async function requestSlotChunk(index, retry = false) {
@@ -1027,6 +1080,7 @@ function beginSlotImageRead(message) {
     chunkRetries: 0,
     nextLogPercent: 10,
     rawChunkSize: match[6] == null ? DEFAULT_SLOT_READ_RAW_CHUNK_SIZE : parseInt(match[6], 10),
+    streaming: false,
     startedAt,
     pending: false
   };
@@ -1040,7 +1094,10 @@ function beginSlotImageRead(message) {
   const status = document.getElementById('slotReadStatus');
   status.hidden = false;
   status.textContent = `槽位 ${slotReadState.slot + 1}：准备接收 ${formatSlotBytes(size)}`;
-  void requestSlotChunk(0);
+  if (slotStreamSupport)
+    void startSlotImageStream();
+  else
+    void requestSlotChunk(0);
   return true;
 }
 
@@ -1120,6 +1177,9 @@ function receiveSlotChunk(data) {
 
   if (slotReadState.received === slotReadState.size) {
     finishSlotImageRead();
+  } else if (slotReadState.streaming) {
+    slotReadState.nextChunkIndex = expected.index + 1;
+    armSlotChunkTimeout(expected.index + 1);
   } else {
     void requestSlotChunk(expected.index + 1);
   }
@@ -1141,6 +1201,20 @@ function restoreRotated2bpp(data, width, height) {
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       set2bppPixel(output, width, x, y, get2bppPixel(data, height, y, width - 1 - x));
+    }
+  }
+  return output;
+}
+
+function restoreSSD1619_213_250x122Plane(data) {
+  const nativeWidth = 128;
+  const activeWidth = 250;
+  const activeHeight = 122;
+  const output = new Uint8Array(Math.ceil(activeWidth / 8) * activeHeight).fill(0xFF);
+  for (let y = 0; y < activeHeight; y++) {
+    for (let x = 0; x < activeWidth; x++) {
+      set1bppPixel(output, activeWidth, x, y,
+        get1bppPixel(data, nativeWidth, y, activeWidth - 1 - x));
     }
   }
   return output;
@@ -1193,16 +1267,28 @@ function finishSlotImageRead() {
   try {
     const mode = meta.colorId === 2 ? 'blackWhiteColor' : meta.colorId === 3 ? 'threeColor' :
       meta.colorId === 4 ? 'fourColor' : meta.colorId === 6 ? 'sixColor' : 'sevenColor';
-    const normalized = normalizeSlotImageData(meta);
+    let normalized = normalizeSlotImageData(meta);
     const driverValue = document.getElementById('epddriver').value.toLowerCase();
+    let previewWidth = meta.width;
+    let previewHeight = meta.height;
+    if (driverValue === '19' && meta.width === 128 && meta.height === 250 && meta.colorId === 3) {
+      const planeSize = Math.ceil(meta.width / 8) * meta.height;
+      const black = restoreSSD1619_213_250x122Plane(normalized.slice(0, planeSize));
+      const red = restoreSSD1619_213_250x122Plane(normalized.slice(planeSize, planeSize * 2));
+      normalized = new Uint8Array(black.length + red.length);
+      normalized.set(black, 0);
+      normalized.set(red, black.length);
+      previewWidth = 250;
+      previewHeight = 122;
+    }
     const imageData = (driverValue === '08' || driverValue === '09')
-      ? decodeUC8159SlotData(normalized, meta.width, meta.height)
-      : decodeProcessedData(normalized, meta.width, meta.height, mode);
+      ? decodeUC8159SlotData(normalized, previewWidth, previewHeight)
+      : decodeProcessedData(normalized, previewWidth, previewHeight, mode);
     const existingPreview = slotImageCache.get(meta.slot);
     if (!existingPreview || existingPreview.previewKind !== 'original') {
       saveSlotImageCache(meta.slot, {
-        width: meta.width,
-        height: meta.height,
+        width: previewWidth,
+        height: previewHeight,
         size: meta.size,
         colorId: meta.colorId,
         dataUrl: createSlotPreviewDataUrl(imageData),
@@ -1307,8 +1393,9 @@ async function setDriver() {
 async function setLedEnabled() {
   const ledToggle = document.getElementById('ledEnabled');
   const enabled = ledToggle.checked;
+  const rgb = getLedRgb();
 
-  if (!isBleConnected() || appVersion < LED_CONTROL_MIN_VERSION) {
+  if (!isBleConnected() || !firmwareVersion.ledControl) {
     ledToggle.checked = !enabled;
     addLog('当前固件不支持 LED 开关，请升级到 0x40 或更高版本。');
     updateButtonStatus();
@@ -1316,12 +1403,119 @@ async function setLedEnabled() {
   }
 
   ledToggle.disabled = true;
-  if (await write(EpdCmd.SET_LED, new Uint8Array([enabled ? 1 : 0]))) {
-    addLog(`LED 指示已${enabled ? '开启' : '关闭'}，设置已保存。`);
+  if (await write(EpdCmd.SET_LED, new Uint8Array([enabled ? 1 : 0, rgb.red, rgb.green, rgb.blue]))) {
+    addLog(enabled ? 'LED ON' : 'LED OFF');
   } else {
     ledToggle.checked = !enabled;
   }
   updateButtonStatus();
+}
+
+function clampLedChannel(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(255, parsed)) : 0;
+}
+
+function getLedRgb() {
+  return {
+    red: clampLedChannel(document.getElementById('ledRed').value),
+    green: clampLedChannel(document.getElementById('ledGreen').value),
+    blue: clampLedChannel(document.getElementById('ledBlue').value)
+  };
+}
+
+function ledRgbToHex(red, green, blue) {
+  return `#${[red, green, blue].map((value) => clampLedChannel(value).toString(16).padStart(2, '0')).join('')}`.toUpperCase();
+}
+
+function ledHexToRgb(hex) {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!match) return null;
+  return {
+    red: parseInt(match[1].slice(0, 2), 16),
+    green: parseInt(match[1].slice(2, 4), 16),
+    blue: parseInt(match[1].slice(4, 6), 16)
+  };
+}
+
+function setLedRgb(red, green, blue, scheduleWrite = false) {
+  const values = [clampLedChannel(red), clampLedChannel(green), clampLedChannel(blue)];
+  const channels = ['Red', 'Green', 'Blue'];
+  channels.forEach((channel, index) => {
+    const range = document.getElementById(`led${channel}`);
+    range.value = String(values[index]);
+    document.getElementById(`led${channel}Value`).value = String(values[index]);
+    updateRangeFill(range);
+  });
+
+  const hex = ledRgbToHex(...values);
+  document.getElementById('ledColorHex').textContent = hex;
+  document.getElementById('ledColorSwatch').style.backgroundColor = hex;
+  document.getElementById('ledCustomColor').value = hex.toLowerCase();
+  if (scheduleWrite) scheduleLedColorWrite();
+}
+
+async function writeLedColor() {
+  if (!isBleConnected() || !firmwareVersion.ledControl) return;
+  const rgb = getLedRgb();
+  const enabled = document.getElementById('ledEnabled').checked;
+  await write(EpdCmd.SET_LED, new Uint8Array([enabled ? 1 : 0, rgb.red, rgb.green, rgb.blue]));
+}
+
+function scheduleLedColorWrite() {
+  clearTimeout(ledColorWriteTimer);
+  ledColorWriteTimer = setTimeout(() => { void writeLedColor(); }, LED_COLOR_WRITE_DELAY_MS);
+}
+
+function closeLedColorPopover() {
+  const button = document.getElementById('ledColorButton');
+  const popover = document.getElementById('ledColorPopover');
+  popover.hidden = true;
+  button.setAttribute('aria-expanded', 'false');
+}
+
+function initLedColorControl() {
+  const control = document.querySelector('.led-color-control');
+  const button = document.getElementById('ledColorButton');
+  const popover = document.getElementById('ledColorPopover');
+  const customColor = document.getElementById('ledCustomColor');
+
+  button.addEventListener('click', () => {
+    if (button.disabled) return;
+    const open = popover.hidden;
+    popover.hidden = !open;
+    button.setAttribute('aria-expanded', String(open));
+  });
+
+  document.querySelectorAll('[data-led-color]').forEach((preset) => {
+    preset.addEventListener('click', () => {
+      const rgb = ledHexToRgb(preset.dataset.ledColor);
+      if (rgb) setLedRgb(rgb.red, rgb.green, rgb.blue, true);
+    });
+  });
+
+  customColor.addEventListener('input', () => {
+    const rgb = ledHexToRgb(customColor.value);
+    if (rgb) setLedRgb(rgb.red, rgb.green, rgb.blue, true);
+  });
+
+  ['Red', 'Green', 'Blue'].forEach((channel) => {
+    document.getElementById(`led${channel}`).addEventListener('input', () => {
+      const rgb = getLedRgb();
+      setLedRgb(rgb.red, rgb.green, rgb.blue, true);
+    });
+  });
+
+  document.addEventListener('click', (event) => {
+    if (!popover.hidden && !control.contains(event.target)) closeLedColorPopover();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !popover.hidden) {
+      closeLedColorPopover();
+      button.focus();
+    }
+  });
+  setLedRgb(0, 0, 255);
 }
 
 function getWeekStart() {
@@ -1422,17 +1616,19 @@ function isGDEY037Z03Driver(selectElement) {
     size === '3.7_416_240' && (label.includes('GDEY037Z03') || label.includes('YS4370JS0C3') || label.includes('LG 3.7'));
 }
 
+function isSSD1619_213_250x122Driver(selectElement) {
+  return (selectElement.value || '').toLowerCase() === '19';
+}
+
 function get1bppPixel(data, width, x, y) {
-  const pixelIndex = y * width + x;
-  const byteIndex = pixelIndex >> 3;
-  const shift = 7 - (pixelIndex & 0x07);
+  const byteIndex = y * Math.ceil(width / 8) + Math.floor(x / 8);
+  const shift = 7 - (x & 0x07);
   return (data[byteIndex] >> shift) & 0x01;
 }
 
 function set1bppPixel(data, width, x, y, value) {
-  const pixelIndex = y * width + x;
-  const byteIndex = pixelIndex >> 3;
-  const mask = 0x80 >> (pixelIndex & 0x07);
+  const byteIndex = y * Math.ceil(width / 8) + Math.floor(x / 8);
+  const mask = 0x80 >> (x & 0x07);
   if (value) data[byteIndex] |= mask;
   else data[byteIndex] &= ~mask;
 }
@@ -1456,6 +1652,21 @@ function convertGDEY037Z03Plane(data, srcWidth = canvas.width, srcHeight = canva
     }
   }
 
+  return output;
+}
+
+function convertSSD1619_213_250x122Plane(data, srcWidth = canvas.width, srcHeight = canvas.height) {
+  const nativeWidth = 128;
+  const nativeHeight = 250;
+  if (srcWidth !== 250 || srcHeight !== 122) return new Uint8Array(data);
+
+  const output = new Uint8Array((nativeWidth * nativeHeight) / 8).fill(0xFF);
+  for (let y = 0; y < srcHeight; y++) {
+    for (let x = 0; x < srcWidth; x++) {
+      set1bppPixel(output, nativeWidth, y, nativeHeight - 1 - x,
+        get1bppPixel(data, srcWidth, x, y));
+    }
+  }
   return output;
 }
 
@@ -1529,6 +1740,7 @@ async function sendimg(options = {}) {
   imageTransferActive = true;
   updateButtonStatus();
   const targetSlot = Number.isInteger(options.slot) ? options.slot : null;
+  const refreshAfterSave = targetSlot != null && options.refreshAfterSave === true;
   if (targetSlot != null) {
     cacheCurrentSlotPreview(targetSlot, processedData, ditherMode);
     if (targetSlot < 0 || targetSlot >= slotState.count ||
@@ -1557,6 +1769,11 @@ async function sendimg(options = {}) {
       blackWhiteData = convertGDEY037Z03Plane(blackWhiteData, canvas.width, canvas.height);
       redWhiteData = convertGDEY037Z03Plane(redWhiteData, canvas.width, canvas.height);
       addLog('3.7BWR 图像数据已按原生 240x416 重排');
+    }
+    if (isSSD1619_213_250x122Driver(epdDriverSelect)) {
+      blackWhiteData = convertSSD1619_213_250x122Plane(blackWhiteData, canvas.width, canvas.height);
+      redWhiteData = convertSSD1619_213_250x122Plane(redWhiteData, canvas.width, canvas.height);
+      addLog('2.13寸图像数据已按 128x250 显存旋转并应用 X + 8 px 偏移');
     }
     if (epdDriverSelect.value === '08' || epdDriverSelect.value === '09') {
       transferOk = await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw');
@@ -1589,13 +1806,19 @@ async function sendimg(options = {}) {
   }
 
   const sendTime = (new Date().getTime() - startTime) / 1000.0;
-  addLog(`图片数据发送完成！耗时: ${sendTime}s，等待屏幕刷新。`);
-  setStatus(`图片数据发送完成，正在刷新屏幕...`);
-  startImageRefreshWait();
-  if (!await write(EpdCmd.REFRESH)) {
+  const savingSlot = targetSlot != null;
+  addLog(savingSlot
+    ? `图片数据发送完成！耗时: ${sendTime}s，正在提交槽位。`
+    : `图片数据发送完成！耗时: ${sendTime}s，等待屏幕刷新。`);
+  setStatus(savingSlot ? '图片数据发送完成，正在保存槽位...' : '图片数据发送完成，正在刷新屏幕...');
+  startImageRefreshWait(targetSlot != null ? 'slot' : 'refresh');
+  const completionSent = savingSlot
+    ? await write(EpdCmd.SET_SLOT, new Uint8Array([refreshAfterSave ? 3 : 2, targetSlot]))
+    : await write(EpdCmd.REFRESH);
+  if (!completionSent) {
     cancelImageRefreshWait();
     if (targetSlot != null) removeSlotImageCache(targetSlot);
-    setStatus('刷新命令发送失败。');
+    setStatus(savingSlot ? '槽位提交命令发送失败。' : '刷新命令发送失败。');
     imageTransferActive = false;
     updateButtonStatus();
     return false;
@@ -1645,9 +1868,10 @@ function downloadDataArray() {
 
 function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPending || slotReadState !== null || otaBusy) {
   const connected = gattServer != null && gattServer.connected;
+  const canReconnect = bleDevice != null && bleDevice.gatt && !bleDevice.gatt.connected;
   const status = forceDisabled ? 'disabled' : (connected ? null : 'disabled');
   document.getElementById("connectbutton").disabled = otaBusy;
-  document.getElementById("reconnectbutton").disabled = (gattServer == null || gattServer.connected) ? 'disabled' : null;
+  document.getElementById("reconnectbutton").disabled = otaBusy || reconnectActive || forceDisabled || !canReconnect;
   document.getElementById("sendcmdbutton").disabled = status;
   document.getElementById("calendarmodebutton").disabled = status;
   document.getElementById("clockmodebutton").disabled = status;
@@ -1656,7 +1880,14 @@ function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPen
   const calendarStyleSend = document.getElementById("calendarStyleSend");
   if (calendarStyleSend) calendarStyleSend.disabled = Boolean(status);
   document.getElementById("setDriverbutton").disabled = status;
-  document.getElementById("ledEnabled").disabled = Boolean(status) || appVersion < LED_CONTROL_MIN_VERSION;
+  document.getElementById("ledEnabled").disabled = Boolean(status) || !firmwareVersion.ledControl;
+  const ledColorDisabled = Boolean(status) || !firmwareVersion.ledControl;
+  document.getElementById("ledColorButton").disabled = ledColorDisabled;
+  document.querySelector('.led-color-control').classList.toggle('is-disabled', ledColorDisabled);
+  document.querySelectorAll('#ledColorPopover input, #ledColorPopover button').forEach((control) => {
+    control.disabled = ledColorDisabled;
+  });
+  if (ledColorDisabled) closeLedColorPopover();
   document.getElementById("refreshSlotsButton").disabled = status;
   document.getElementById("eraseAllSlotsButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
   document.getElementById("startSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
@@ -1770,11 +2001,53 @@ async function preConnect() {
 }
 
 async function reConnect() {
-  if (bleDevice != null && bleDevice.gatt.connected)
-    bleDevice.gatt.disconnect();
-  resetVariables();
-  addLog("正在重连");
-  setTimeout(async function () { await connect(); }, 300);
+  if (reconnectActive) return;
+  reconnectActive = true;
+  updateButtonStatus(true);
+  try {
+    if (bleDevice == null && navigator.bluetooth && typeof navigator.bluetooth.getDevices === 'function') {
+      const devices = await navigator.bluetooth.getDevices();
+      bleDevice = devices.find(device => device && (device.name || '').startsWith('NRF_EPD')) || null;
+    }
+
+    if (bleDevice == null) {
+      addLog('没有可重连的已授权设备，重新选择设备。');
+      updateButtonStatus();
+      await preConnect();
+      return;
+    }
+
+    const device = bleDevice;
+    device.removeEventListener('gattserverdisconnected', disconnect);
+    if (device.gatt.connected) {
+      const disconnected = new Promise(resolve =>
+        device.addEventListener('gattserverdisconnected', resolve, { once: true }));
+      device.gatt.disconnect();
+      await Promise.race([disconnected, sleep(1000)]);
+    }
+
+    for (let attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS; attempt++) {
+      resetVariables({ clearLog: false });
+      bleDevice = device;
+      device.removeEventListener('gattserverdisconnected', disconnect);
+      device.addEventListener('gattserverdisconnected', disconnect);
+      addLog(attempt === 1 ? '正在重连' : `正在重连 (${attempt}/${RECONNECT_MAX_ATTEMPTS})`);
+      if (await connect()) return;
+
+      if (attempt < RECONNECT_MAX_ATTEMPTS) {
+        if (device.gatt.connected) device.gatt.disconnect();
+        addLog('GATT 服务发现未完成，正在自动重试。');
+        await sleep(RECONNECT_RETRY_DELAY_MS * attempt);
+      }
+    }
+    addLog('自动重连失败，请确认设备仍在广播后重试。');
+  } catch (e) {
+    console.error(e);
+    if (e.message) addLog('reconnect: ' + e.message);
+  } finally {
+    reconnectActive = false;
+    updateButtonStatus();
+  }
 }
 
 function handleDisplayError(code) {
@@ -1813,7 +2086,14 @@ function handleNotify(value, idx) {
     if (data.length > 10) epdpins.value += bytes2hex(data.slice(10, 11));
     currentPinsValue = epdpins.value.trim().toLowerCase();
     epddriver.value = bytes2hex(data.slice(7, 8));
-    document.getElementById('ledEnabled').checked = data.length > 14 ? data[14] !== 0 : true;
+    const ledEnabled = data.length > 14 ? data[14] !== 0 : true;
+    document.getElementById('ledEnabled').checked = ledEnabled;
+    if (data.length === EPD_CONFIG_SIZE) {
+      setLedRgb(data[16], data[17], data[18], false);
+    } else if (data.length > 9 && data[9] >= 16 && data[9] <= 18) {
+      setLedRgb(data[9] === 16 ? 255 : 0, data[9] === 17 ? 255 : 0, data[9] === 18 ? 255 : 0, false);
+    }
+    addLog(ledEnabled ? 'LED ON' : 'LED OFF');
     displayErrorActive = false;
     updateDitcherOptions();
   } else {
@@ -1845,6 +2125,7 @@ function handleNotify(value, idx) {
       const mtuParts = msg.substring(4).trim().split(/\s+/);
       const mtuSize = parseInt(mtuParts[0], 10);
       rleSupport = mtuParts.includes('rle=1');
+      slotStreamSupport = mtuParts.includes('slot_stream=1');
       document.getElementById('mtusize').value = mtuSize;
       addLog(`MTU 已更新为: ${mtuSize}`);
       if (rleSupport) addLog('设备已启用 RLE 压缩传输。');
@@ -1857,7 +2138,7 @@ function handleNotify(value, idx) {
 }
 
 async function connect() {
-  if (bleDevice == null || epdCharacteristic != null) return;
+  if (bleDevice == null || epdCharacteristic != null) return false;
 
   try {
     addLog("正在连接: " + bleDevice.name);
@@ -1870,21 +2151,22 @@ async function connect() {
   } catch (e) {
     console.error(e);
     if (e.message) addLog("connect: " + e.message);
+    if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
     disconnect();
-    return;
+    return false;
   }
 
   try {
     const versionCharacteristic = await epdService.getCharacteristic(EPD_VERSION_UUID);
     const versionData = await versionCharacteristic.readValue();
-    appVersion = versionData.getUint8(0);
-    addLog(`固件版本: 0x${appVersion.toString(16)}`);
+    firmwareVersion = parseFirmwareVersion(versionData);
+    addLog(`固件版本: ${firmwareVersion.label}`);
   } catch (e) {
     console.error(e);
-    appVersion = 0x15;
+    firmwareVersion = { label: '未知', ledControl: false, outdated: true };
   }
 
-  if (appVersion < 0x16) {
+  if (firmwareVersion.outdated) {
     const onlineURL = "https://jcf12348.github.io/epd/";
     alert("!!!注意!!!\n当前固件版本过低，可能无法正常使用部分功能，建议升级到最新版本。");
     if (confirm('是否访问在线上位机？')) location.href = onlineURL;
@@ -1914,6 +2196,7 @@ async function connect() {
 
   document.getElementById("connectbutton").innerHTML = '断开';
   updateButtonStatus();
+  return true;
 }
 
 function setStatus(statusText) {
@@ -3052,6 +3335,7 @@ function initRangeFill() {
 function initEventHandlers() {
   initGlobalNavActive();
   initRangeFill();
+  initLedColorControl();
   initCalendarStyleControls();
   updateDriverMeta();
   document.getElementById("clear-canvas").addEventListener("click", clearCanvas);
