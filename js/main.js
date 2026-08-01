@@ -15,6 +15,9 @@ let slotImageCacheScope = '';
 let slotPreviewPending = new Set();
 let rleSupport = false;
 let slotStreamSupport = false;
+let clockFontSupport = false;
+let clockFontBusy = false;
+let clockFontSourceCanvas = null;
 let imageTransferActive = false;
 let imageRefreshPending = false;
 let imageRefreshTimer = null;
@@ -47,6 +50,11 @@ const SLOT_PREVIEW_JPEG_QUALITY = 0.88;
 const RECONNECT_MAX_ATTEMPTS = 3;
 const RECONNECT_RETRY_DELAY_MS = 600;
 const LED_COLOR_WRITE_DELAY_MS = 100;
+const CLOCK_FONT_GLYPH_WIDTH = 32;
+const CLOCK_FONT_GLYPH_HEIGHT = 80;
+const CLOCK_FONT_GLYPHS = '0123456789:';
+const CLOCK_FONT_GLYPH_BYTES = CLOCK_FONT_GLYPH_WIDTH * CLOCK_FONT_GLYPH_HEIGHT / 8;
+const CLOCK_FONT_DATA_SIZE = CLOCK_FONT_GLYPHS.length * CLOCK_FONT_GLYPH_BYTES;
 
 const PAGE_BACKGROUND_STORAGE_KEY = 'epdCustomPageBackground';
 const PAGE_BACKGROUND_SETTINGS_STORAGE_KEY = 'epdCustomPageBackgroundSettings';
@@ -94,6 +102,7 @@ const EpdCmd = {
   SET_SLIDE: 0x33,
   GET_IMAGE: 0x34,
   GET_SLOTS: 0x35,
+  SET_FONT: 0x36,
 
   SET_CONFIG: 0x90,
   SYS_RESET: 0x91,
@@ -191,6 +200,8 @@ function resetVariables(options = {}) {
   slotPreviewPending = new Set();
   rleSupport = false;
   slotStreamSupport = false;
+  clockFontSupport = false;
+  clockFontBusy = false;
   imageTransferActive = false;
   imageRefreshPending = false;
   imageCompletionKind = 'refresh';
@@ -252,7 +263,8 @@ async function write(cmd, data, withResponse = true) {
     payload.push(...data)
   }
   const isSlotChunkRequest = cmd === EpdCmd.GET_IMAGE && payload.length === 4;
-  if (cmd !== EpdCmd.WRITE_IMG && !isSlotChunkRequest) {
+  const isClockFontData = cmd === EpdCmd.SET_FONT && payload[1] === 1;
+  if (cmd !== EpdCmd.WRITE_IMG && !isSlotChunkRequest && !isClockFontData) {
     const logPayload = cmd === EpdCmd.SET_LED
       ? payload.map(value => value.toString(16).padStart(2, '0')).join(' ')
       : bytes2hex(payload);
@@ -276,6 +288,132 @@ function formatSlotBytes(size) {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function toggleClockFontPanel() {
+  const panel = document.getElementById('clockFontPanel');
+  const button = document.getElementById('clockFontPanelToggle');
+  panel.hidden = !panel.hidden;
+  button.setAttribute('aria-expanded', String(!panel.hidden));
+}
+
+function initClockFontCanvas() {
+  const canvas = document.getElementById('clockFontCanvas');
+  clockFontSourceCanvas = document.createElement('canvas');
+  clockFontSourceCanvas.width = canvas.width;
+  clockFontSourceCanvas.height = canvas.height;
+  const source = clockFontSourceCanvas.getContext('2d', { willReadFrequently: true });
+  source.fillStyle = '#fff';
+  source.fillRect(0, 0, canvas.width, canvas.height);
+  source.fillStyle = '#000';
+  source.textAlign = 'center';
+  source.textBaseline = 'middle';
+  source.font = 'bold 68px sans-serif';
+  for (let index = 0; index < CLOCK_FONT_GLYPHS.length; index++)
+    source.fillText(CLOCK_FONT_GLYPHS[index], index * CLOCK_FONT_GLYPH_WIDTH + CLOCK_FONT_GLYPH_WIDTH / 2,
+      CLOCK_FONT_GLYPH_HEIGHT / 2 + 2);
+  renderClockFontPreview();
+}
+
+function renderClockFontPreview() {
+  if (!clockFontSourceCanvas) return;
+  const canvas = document.getElementById('clockFontCanvas');
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  const source = clockFontSourceCanvas.getContext('2d', { willReadFrequently: true })
+    .getImageData(0, 0, canvas.width, canvas.height);
+  const threshold = parseInt(document.getElementById('clockFontThreshold').value, 10);
+  for (let offset = 0; offset < source.data.length; offset += 4) {
+    const luminance = source.data[offset] * 0.299 + source.data[offset + 1] * 0.587 + source.data[offset + 2] * 0.114;
+    const value = luminance < threshold ? 0 : 255;
+    source.data[offset] = source.data[offset + 1] = source.data[offset + 2] = value;
+    source.data[offset + 3] = 255;
+  }
+  context.putImageData(source, 0, 0);
+  document.getElementById('clockFontThresholdValue').textContent = threshold;
+}
+
+async function loadClockFontImage() {
+  const file = document.getElementById('clockFontFile').files?.[0];
+  if (!file || !clockFontSourceCanvas) return;
+  const image = new Image();
+  const url = URL.createObjectURL(file);
+  try {
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = reject;
+      image.src = url;
+    });
+    const context = clockFontSourceCanvas.getContext('2d', { willReadFrequently: true });
+    context.fillStyle = '#fff';
+    context.fillRect(0, 0, clockFontSourceCanvas.width, clockFontSourceCanvas.height);
+    context.drawImage(image, 0, 0, clockFontSourceCanvas.width, clockFontSourceCanvas.height);
+    renderClockFontPreview();
+    addLog(`时钟字库图片已加载：${file.name}`);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function packClockFontImageData(imageData) {
+  const packed = new Uint8Array(CLOCK_FONT_DATA_SIZE);
+  for (let glyph = 0; glyph < CLOCK_FONT_GLYPHS.length; glyph++) {
+    for (let y = 0; y < CLOCK_FONT_GLYPH_HEIGHT; y++) {
+      for (let x = 0; x < CLOCK_FONT_GLYPH_WIDTH; x++) {
+        const pixel = (y * imageData.width + glyph * CLOCK_FONT_GLYPH_WIDTH + x) * 4;
+        if (imageData.data[pixel] < 128)
+          packed[glyph * CLOCK_FONT_GLYPH_BYTES + y * 4 + (x >> 3)] |= 0x80 >> (x & 7);
+      }
+    }
+  }
+  return packed;
+}
+
+function setClockFontStatus(message) {
+  document.getElementById('clockFontStatus').textContent = message;
+}
+
+async function queryClockFont() {
+  if (clockFontSupport && isBleConnected()) await write(EpdCmd.SET_FONT, new Uint8Array([4]));
+}
+
+async function uploadClockFont() {
+  if (!clockFontSupport || clockFontBusy || !isBleConnected()) return;
+  const canvas = document.getElementById('clockFontCanvas');
+  const data = packClockFontImageData(canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height));
+  const chunkSize = Math.max(16, parseInt(document.getElementById('mtusize').value, 10) - 2);
+  clockFontBusy = true;
+  updateButtonStatus();
+  setClockFontStatus('正在擦除字体区域...');
+  try {
+    if (!await write(EpdCmd.SET_FONT, new Uint8Array([0]))) return;
+    for (let offset = 0; offset < data.length; offset += chunkSize) {
+      const chunk = data.slice(offset, offset + chunkSize);
+      if (!await write(EpdCmd.SET_FONT, new Uint8Array([1, ...chunk]))) return;
+      setClockFontStatus(`正在上传字体：${Math.min(100, Math.round((offset + chunk.length) * 100 / data.length))}%`);
+    }
+    if (await write(EpdCmd.SET_FONT, new Uint8Array([2]))) {
+      setClockFontStatus('字体已上传，将在下次时钟刷新时使用。');
+      addLog('时钟字体上传完成。');
+    }
+  } finally {
+    clockFontBusy = false;
+    updateButtonStatus();
+  }
+}
+
+async function eraseClockFont() {
+  if (!clockFontSupport || clockFontBusy || !isBleConnected() || !confirm('确认恢复默认七段时钟字体？')) return;
+  clockFontBusy = true;
+  updateButtonStatus();
+  try {
+    if (await write(EpdCmd.SET_FONT, new Uint8Array([3]))) {
+      setClockFontStatus('已恢复默认七段时钟字体。');
+      addLog('自定义时钟字体已擦除。');
+    }
+  } finally {
+    clockFontBusy = false;
+    updateButtonStatus();
+  }
 }
 
 function setOtaStatus(message, progress = null) {
@@ -1393,7 +1531,6 @@ async function setDriver() {
 async function setLedEnabled() {
   const ledToggle = document.getElementById('ledEnabled');
   const enabled = ledToggle.checked;
-  const rgb = getLedRgb();
 
   if (!isBleConnected() || !firmwareVersion.ledControl) {
     ledToggle.checked = !enabled;
@@ -1403,10 +1540,29 @@ async function setLedEnabled() {
   }
 
   ledToggle.disabled = true;
-  if (await write(EpdCmd.SET_LED, new Uint8Array([enabled ? 1 : 0, rgb.red, rgb.green, rgb.blue]))) {
+  if (await write(EpdCmd.SET_LED, buildLedPayload(enabled))) {
     addLog(enabled ? 'LED ON' : 'LED OFF');
   } else {
     ledToggle.checked = !enabled;
+  }
+  updateButtonStatus();
+}
+
+async function setLedTransferChase() {
+  const checkbox = document.getElementById('ledTransferChase');
+  const chase = checkbox.checked;
+
+  if (!isBleConnected() || !firmwareVersion.ledControl) {
+    checkbox.checked = !chase;
+    updateButtonStatus();
+    return;
+  }
+
+  checkbox.disabled = true;
+  if (await write(EpdCmd.SET_LED, buildLedPayload())) {
+    addLog(chase ? '传输灯效：彩色跑马灯' : '传输灯效：彩色呼吸灯');
+  } else {
+    checkbox.checked = !chase;
   }
   updateButtonStatus();
 }
@@ -1422,6 +1578,19 @@ function getLedRgb() {
     green: clampLedChannel(document.getElementById('ledGreen').value),
     blue: clampLedChannel(document.getElementById('ledBlue').value)
   };
+}
+
+function ledBrightnessToByte() {
+  const parsed = Number.parseInt(document.getElementById('ledBrightness').value, 10);
+  const percent = Number.isFinite(parsed) ? Math.max(1, Math.min(100, parsed)) : 100;
+  return Math.max(1, Math.min(255, Math.round(percent * 255 / 100)));
+}
+
+function buildLedPayload(enabled = document.getElementById('ledEnabled').checked) {
+  const rgb = getLedRgb();
+  const chase = document.getElementById('ledTransferChase').checked;
+  const brightness = ledBrightnessToByte();
+  return new Uint8Array([enabled ? 1 : 0, rgb.red, rgb.green, rgb.blue, chase ? 0 : 1, brightness]);
 }
 
 function ledRgbToHex(red, green, blue) {
@@ -1455,11 +1624,18 @@ function setLedRgb(red, green, blue, scheduleWrite = false) {
   if (scheduleWrite) scheduleLedColorWrite();
 }
 
+function setLedBrightness(percent, scheduleWrite = false) {
+  const brightness = Math.max(1, Math.min(100, Number.parseInt(percent, 10) || 100));
+  const range = document.getElementById('ledBrightness');
+  range.value = String(brightness);
+  document.getElementById('ledBrightnessValue').value = `${brightness}%`;
+  updateRangeFill(range);
+  if (scheduleWrite) scheduleLedColorWrite();
+}
+
 async function writeLedColor() {
   if (!isBleConnected() || !firmwareVersion.ledControl) return;
-  const rgb = getLedRgb();
-  const enabled = document.getElementById('ledEnabled').checked;
-  await write(EpdCmd.SET_LED, new Uint8Array([enabled ? 1 : 0, rgb.red, rgb.green, rgb.blue]));
+  await write(EpdCmd.SET_LED, buildLedPayload());
 }
 
 function scheduleLedColorWrite() {
@@ -1506,6 +1682,10 @@ function initLedColorControl() {
     });
   });
 
+  document.getElementById('ledBrightness').addEventListener('input', (event) => {
+    setLedBrightness(event.target.value, true);
+  });
+
   document.addEventListener('click', (event) => {
     if (!popover.hidden && !control.contains(event.target)) closeLedColorPopover();
   });
@@ -1516,6 +1696,7 @@ function initLedColorControl() {
     }
   });
   setLedRgb(0, 0, 255);
+  setLedBrightness(100);
 }
 
 function getWeekStart() {
@@ -1866,7 +2047,7 @@ function downloadDataArray() {
   URL.revokeObjectURL(link.href);
 }
 
-function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPending || slotReadState !== null || otaBusy) {
+function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPending || slotReadState !== null || otaBusy || clockFontBusy) {
   const connected = gattServer != null && gattServer.connected;
   const canReconnect = bleDevice != null && bleDevice.gatt && !bleDevice.gatt.connected;
   const status = forceDisabled ? 'disabled' : (connected ? null : 'disabled');
@@ -1882,6 +2063,7 @@ function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPen
   document.getElementById("setDriverbutton").disabled = status;
   document.getElementById("ledEnabled").disabled = Boolean(status) || !firmwareVersion.ledControl;
   const ledColorDisabled = Boolean(status) || !firmwareVersion.ledControl;
+  document.getElementById('ledTransferChase').disabled = ledColorDisabled;
   document.getElementById("ledColorButton").disabled = ledColorDisabled;
   document.querySelector('.led-color-control').classList.toggle('is-disabled', ledColorDisabled);
   document.querySelectorAll('#ledColorPopover input, #ledColorPopover button').forEach((control) => {
@@ -1893,6 +2075,8 @@ function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPen
   document.getElementById("startSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
   document.getElementById("randomSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
   document.getElementById("stopSlotSlideButton").disabled = status;
+  document.getElementById('clockFontUploadButton').disabled = Boolean(status) || !clockFontSupport;
+  document.getElementById('clockFontEraseButton').disabled = Boolean(status) || !clockFontSupport;
   updateOtaControls();
   renderSlotGrid(forceDisabled);
 }
@@ -2086,8 +2270,13 @@ function handleNotify(value, idx) {
     if (data.length > 10) epdpins.value += bytes2hex(data.slice(10, 11));
     currentPinsValue = epdpins.value.trim().toLowerCase();
     epddriver.value = bytes2hex(data.slice(7, 8));
-    const ledEnabled = data.length > 14 ? data[14] !== 0 : true;
+    const ledFlags = data.length > 14 ? data[14] : 1;
+    const ledEnabled = (ledFlags & 0x01) !== 0;
+    const ledChase = data[15] === 2 && (ledFlags & 0x02) === 0;
+    const ledBrightnessLevel = ledFlags >> 2;
     document.getElementById('ledEnabled').checked = ledEnabled;
+    document.getElementById('ledTransferChase').checked = ledChase;
+    setLedBrightness(ledBrightnessLevel === 0 ? 100 : Math.round(ledBrightnessLevel * 100 / 63), false);
     if (data.length === EPD_CONFIG_SIZE) {
       setLedRgb(data[16], data[17], data[18], false);
     } else if (data.length > 9 && data[9] >= 16 && data[9] <= 18) {
@@ -2121,14 +2310,23 @@ function handleNotify(value, idx) {
         status.textContent = errorMessage;
         addLog(errorMessage);
       }
+    } else if (msg.startsWith('font=')) {
+      const enabled = msg.startsWith('font=1');
+      setClockFontStatus(enabled ? '设备正在使用自定义时钟字体。' : '设备正在使用默认七段时钟字体。');
+    } else if (msg.startsWith('font_error=')) {
+      setClockFontStatus(`字体操作失败：${msg.substring('font_error='.length)}`);
+      clockFontBusy = false;
+      updateButtonStatus();
     } else if (msg.startsWith('mtu=') && msg.length > 4) {
       const mtuParts = msg.substring(4).trim().split(/\s+/);
       const mtuSize = parseInt(mtuParts[0], 10);
       rleSupport = mtuParts.includes('rle=1');
       slotStreamSupport = mtuParts.includes('slot_stream=1');
+      clockFontSupport = mtuParts.includes('clock_font=1');
       document.getElementById('mtusize').value = mtuSize;
       addLog(`MTU 已更新为: ${mtuSize}`);
       if (rleSupport) addLog('设备已启用 RLE 压缩传输。');
+      if (clockFontSupport) void queryClockFont();
     } else if (msg.startsWith('t=') && msg.length > 2) {
       const t = parseInt(msg.substring(2)) + new Date().getTimezoneOffset() * 60;
       addLog(`远端时间: ${new Date(t * 1000).toLocaleString()}`);
@@ -3464,6 +3662,7 @@ document.body.onload = () => {
   paintManager.initPaintTools();
   cropManager.initCropTools();
   initEventHandlers();
+  initClockFontCanvas();
   window.addEventListener('pagehide', disconnectDeviceOnPageExit);
   window.addEventListener('beforeunload', disconnectDeviceOnPageExit);
   disconnectStaleBleConnections();

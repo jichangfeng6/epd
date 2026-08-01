@@ -94,6 +94,78 @@
     display: none;
 }
 
+.clock-font-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
+    gap: 16px;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid rgba(0, 0, 0, 0.12);
+}
+
+.clock-font-panel[hidden] {
+    display: none;
+}
+
+.clock-font-preview-frame {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 120px;
+    padding: 16px;
+    overflow: auto;
+    background: #fff;
+    border: 1px solid rgba(0, 0, 0, 0.14);
+    border-radius: 6px;
+}
+
+#clockFontCanvas {
+    width: min(100%, 704px);
+    height: auto;
+    image-rendering: pixelated;
+}
+
+.clock-font-controls,
+.clock-font-file,
+.clock-font-threshold {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.clock-font-controls {
+    justify-content: center;
+}
+
+.clock-font-threshold {
+    display: grid;
+    grid-template-columns: auto minmax(100px, 1fr) 36px;
+    align-items: center;
+}
+
+.clock-font-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.clock-font-status {
+    min-height: 20px;
+    color: #4b5563;
+}
+
+body.dark-mode .clock-font-panel {
+    border-top-color: rgba(255, 255, 255, 0.16);
+}
+
+body.dark-mode .clock-font-preview-frame {
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+body.dark-mode .clock-font-status {
+    color: #cbd5e1;
+}
+
 .calendar-style-workspace {
     display: grid;
     grid-template-columns: minmax(260px, 0.9fr) minmax(420px, 1.35fr);
@@ -563,6 +635,30 @@ button.secondary:hover {
     cursor: not-allowed;
 }
 
+.led-transfer-option {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 34px;
+    color: var(--body-muted);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    user-select: none;
+}
+
+.led-transfer-option input {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: var(--primary-color);
+}
+
+.led-transfer-option:has(input:disabled) {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
 .led-color-control {
     position: relative;
     display: inline-flex;
@@ -733,6 +829,7 @@ button.secondary:hover {
 .led-channel.red input[type="range"] { --primary-color: #ff3b30; }
 .led-channel.green input[type="range"] { --primary-color: #28a745; }
 .led-channel.blue input[type="range"] { --primary-color: #007aff; }
+.led-channel.brightness input[type="range"] { --primary-color: #8e8e93; }
 
 .led-color-control.is-disabled .led-color-popover {
     display: none;
@@ -2133,7 +2230,8 @@ body.dark-mode .flex-group.debug {
     background: rgba(255, 255, 255, 0.035);
 }
 
-body.dark-mode .led-switch {
+body.dark-mode .led-switch,
+body.dark-mode .led-transfer-option {
     color: var(--body-muted-dark);
 }
 
@@ -2213,6 +2311,9 @@ body.dark-mode.custom-background .canvas-container > .dither-adjust-row {
 }
 
 @media (max-width: 768px) {
+	.clock-font-panel {
+		grid-template-columns: 1fr;
+	}
     body {
         padding: 16px;
     }

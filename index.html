@@ -6,7 +6,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>墨水屏日历</title>
 	<link rel="shortcut icon" type="image/png" href="favicon.png">
-	<link rel="stylesheet" href="css/main.css?v=2026073105">
+	<link rel="stylesheet" href="css/main.css?v=2026080103">
 </head>
 
 <body>
@@ -62,9 +62,14 @@
 								<label class="led-channel red" for="ledRed"><span>红</span><input id="ledRed" type="range" min="0" max="255" step="1" value="0"><output id="ledRedValue" for="ledRed">0</output></label>
 								<label class="led-channel green" for="ledGreen"><span>绿</span><input id="ledGreen" type="range" min="0" max="255" step="1" value="0"><output id="ledGreenValue" for="ledGreen">0</output></label>
 								<label class="led-channel blue" for="ledBlue"><span>蓝</span><input id="ledBlue" type="range" min="0" max="255" step="1" value="255"><output id="ledBlueValue" for="ledBlue">255</output></label>
+								<label class="led-channel brightness" for="ledBrightness"><span>亮</span><input id="ledBrightness" type="range" min="1" max="100" step="1" value="100"><output id="ledBrightnessValue" for="ledBrightness">100%</output></label>
 							</div>
 						</div>
 					</div>
+					<label class="led-transfer-option" for="ledTransferChase" title="勾选后传输图片时使用彩色跑马灯">
+						<input id="ledTransferChase" type="checkbox" onchange="setLedTransferChase()" disabled>
+						<span>传输跑马灯</span>
+					</label>
 				</div>
 				<div class="flex-group debug">
 					<label for="epdpins">引脚</label>
@@ -131,6 +136,7 @@
 					<button id="calendarmodebutton" type="button" class="primary" onclick="syncTime(1)">日历模式</button>
 					<button id="clockmodebutton" type="button" class="primary" onclick="syncTime(2)">时钟模式</button>
 					<button id="calendarstylebutton" type="button" class="secondary" onclick="toggleCalendarStylePanel()" aria-expanded="false" aria-controls="calendarStylePanel">日历风格</button>
+					<button id="clockFontPanelToggle" type="button" class="secondary" onclick="toggleClockFontPanel()" aria-expanded="false" aria-controls="clockFontPanel">时钟字体</button>
 					<button id="clearscreenbutton" type="button" class="secondary" onclick="clearScreen()">清除屏幕</button>
 				</div>
 				<div class="flex-group right debug">
@@ -231,6 +237,27 @@
 							<button id="calendarStyleSend" class="primary" type="button" disabled>生成并发送到设备</button>
 						</div>
 					</div>
+				</div>
+			</div>
+			<div id="clockFontPanel" class="clock-font-panel" hidden>
+				<div class="clock-font-preview-frame">
+					<canvas id="clockFontCanvas" width="352" height="80" aria-label="时钟数字字库预览"></canvas>
+				</div>
+				<div class="clock-font-controls">
+					<label class="clock-font-file" for="clockFontFile" title="选择包含 0 至 9 和冒号的横向字库图片">
+						<span>字库图片</span>
+						<input id="clockFontFile" type="file" accept=".png,.jpg,.jpeg,.bmp,.webp,image/png,image/jpeg,image/bmp,image/webp" onchange="loadClockFontImage()">
+					</label>
+					<label class="clock-font-threshold" for="clockFontThreshold">
+						<span>黑白阈值</span>
+						<input id="clockFontThreshold" type="range" min="0" max="255" value="128" oninput="renderClockFontPreview()">
+						<output id="clockFontThresholdValue" for="clockFontThreshold">128</output>
+					</label>
+					<div class="clock-font-actions">
+						<button id="clockFontUploadButton" type="button" class="primary" onclick="uploadClockFont()" disabled>上传字体</button>
+						<button id="clockFontEraseButton" type="button" class="secondary" onclick="eraseClockFont()" disabled>恢复默认</button>
+					</div>
+					<span id="clockFontStatus" class="clock-font-status" role="status" aria-live="polite">连接设备后读取字库状态</span>
 				</div>
 			</div>
 		</fieldset>
@@ -627,7 +654,7 @@
 	<script type="text/javascript" src="js/paint.js?v=2026072301"></script>
 	<script type="text/javascript" src="js/crop.js?v=2026072302"></script>
 	<script type="text/javascript" src="js/secure-dfu.js?v=2026072703"></script>
-	<script type="text/javascript" src="js/main.js?v=2026073105"></script>
+	<script type="text/javascript" src="js/main.js?v=2026080103"></script>
 </body>
 
 </html>
