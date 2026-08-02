@@ -120,7 +120,7 @@
 }
 
 #clockFontCanvas {
-    width: min(100%, 704px);
+    width: min(100%, 440px);
     height: auto;
     image-rendering: pixelated;
 }

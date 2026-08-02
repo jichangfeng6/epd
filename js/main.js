@@ -16,6 +16,7 @@ let slotPreviewPending = new Set();
 let rleSupport = false;
 let slotStreamSupport = false;
 let clockFontSupport = false;
+let clockFontVersion = 2;
 let clockFontBusy = false;
 let clockFontSourceCanvas = null;
 let imageTransferActive = false;
@@ -50,11 +51,14 @@ const SLOT_PREVIEW_JPEG_QUALITY = 0.88;
 const RECONNECT_MAX_ATTEMPTS = 3;
 const RECONNECT_RETRY_DELAY_MS = 600;
 const LED_COLOR_WRITE_DELAY_MS = 100;
-const CLOCK_FONT_GLYPH_WIDTH = 32;
+const CLOCK_FONT_V1_GLYPH_WIDTH = 32;
+const CLOCK_FONT_V2_GLYPH_WIDTH = 40;
+const CLOCK_FONT_V2_COLON_WIDTH = 8;
+let CLOCK_FONT_GLYPH_WIDTH = CLOCK_FONT_V2_GLYPH_WIDTH;
 const CLOCK_FONT_GLYPH_HEIGHT = 80;
 const CLOCK_FONT_GLYPHS = '0123456789:';
-const CLOCK_FONT_GLYPH_BYTES = CLOCK_FONT_GLYPH_WIDTH * CLOCK_FONT_GLYPH_HEIGHT / 8;
-const CLOCK_FONT_DATA_SIZE = CLOCK_FONT_GLYPHS.length * CLOCK_FONT_GLYPH_BYTES;
+let CLOCK_FONT_GLYPH_BYTES = CLOCK_FONT_GLYPH_WIDTH * CLOCK_FONT_GLYPH_HEIGHT / 8;
+let CLOCK_FONT_DATA_SIZE = 4080;
 
 const PAGE_BACKGROUND_STORAGE_KEY = 'epdCustomPageBackground';
 const PAGE_BACKGROUND_SETTINGS_STORAGE_KEY = 'epdCustomPageBackgroundSettings';
@@ -297,6 +301,21 @@ function toggleClockFontPanel() {
   button.setAttribute('aria-expanded', String(!panel.hidden));
 }
 
+function setClockFontFormat(version) {
+  clockFontVersion = version >= 2 ? 2 : 1;
+  CLOCK_FONT_GLYPH_WIDTH = clockFontVersion >= 2 ? CLOCK_FONT_V2_GLYPH_WIDTH : CLOCK_FONT_V1_GLYPH_WIDTH;
+  CLOCK_FONT_GLYPH_BYTES = CLOCK_FONT_GLYPH_WIDTH * CLOCK_FONT_GLYPH_HEIGHT / 8;
+  CLOCK_FONT_DATA_SIZE = clockFontVersion >= 2
+    ? 10 * CLOCK_FONT_GLYPH_BYTES + CLOCK_FONT_V2_COLON_WIDTH * CLOCK_FONT_GLYPH_HEIGHT / 8
+    : CLOCK_FONT_GLYPHS.length * CLOCK_FONT_GLYPH_BYTES;
+  const canvas = document.getElementById('clockFontCanvas');
+  const width = CLOCK_FONT_GLYPHS.length * CLOCK_FONT_GLYPH_WIDTH;
+  if (canvas.width === width && clockFontSourceCanvas) return;
+  canvas.width = width;
+  canvas.height = CLOCK_FONT_GLYPH_HEIGHT;
+  initClockFontCanvas();
+}
+
 function initClockFontCanvas() {
   const canvas = document.getElementById('clockFontCanvas');
   clockFontSourceCanvas = document.createElement('canvas');
@@ -357,11 +376,17 @@ async function loadClockFontImage() {
 function packClockFontImageData(imageData) {
   const packed = new Uint8Array(CLOCK_FONT_DATA_SIZE);
   for (let glyph = 0; glyph < CLOCK_FONT_GLYPHS.length; glyph++) {
+    const glyphWidth = clockFontVersion >= 2 && glyph === 10 ? CLOCK_FONT_V2_COLON_WIDTH : CLOCK_FONT_GLYPH_WIDTH;
+    const sourceX = glyph * CLOCK_FONT_GLYPH_WIDTH;
+    const glyphOffset = glyph === 10 ? 10 * CLOCK_FONT_GLYPH_BYTES : glyph * CLOCK_FONT_GLYPH_BYTES;
     for (let y = 0; y < CLOCK_FONT_GLYPH_HEIGHT; y++) {
-      for (let x = 0; x < CLOCK_FONT_GLYPH_WIDTH; x++) {
-        const pixel = (y * imageData.width + glyph * CLOCK_FONT_GLYPH_WIDTH + x) * 4;
+      for (let x = 0; x < glyphWidth; x++) {
+        const sampleX = glyphWidth === CLOCK_FONT_GLYPH_WIDTH
+          ? x : Math.floor((x + 0.5) * CLOCK_FONT_GLYPH_WIDTH / glyphWidth);
+        const pixel = (y * imageData.width + sourceX + sampleX) * 4;
         if (imageData.data[pixel] < 128)
-          packed[glyph * CLOCK_FONT_GLYPH_BYTES + y * 4 + (x >> 3)] |= 0x80 >> (x & 7);
+          packed[glyphOffset + y * (glyphWidth / 8) + (x >> 3)] |=
+            0x80 >> (x & 7);
       }
     }
   }
@@ -385,14 +410,15 @@ async function uploadClockFont() {
   updateButtonStatus();
   setClockFontStatus('正在擦除字体区域...');
   try {
-    if (!await write(EpdCmd.SET_FONT, new Uint8Array([0]))) return;
+    const begin = new Uint8Array([clockFontVersion >= 2 ? 5 : 0]);
+    if (!await write(EpdCmd.SET_FONT, begin)) return;
     for (let offset = 0; offset < data.length; offset += chunkSize) {
       const chunk = data.slice(offset, offset + chunkSize);
       if (!await write(EpdCmd.SET_FONT, new Uint8Array([1, ...chunk]))) return;
       setClockFontStatus(`正在上传字体：${Math.min(100, Math.round((offset + chunk.length) * 100 / data.length))}%`);
     }
     if (await write(EpdCmd.SET_FONT, new Uint8Array([2]))) {
-      setClockFontStatus('字体已上传，将在下次时钟刷新时使用。');
+      setClockFontStatus(`字体已上传（${CLOCK_FONT_GLYPH_WIDTH} × ${CLOCK_FONT_GLYPH_HEIGHT}），将在下次时钟刷新时使用。`);
       addLog('时钟字体上传完成。');
     }
   } finally {
@@ -2312,7 +2338,8 @@ function handleNotify(value, idx) {
       }
     } else if (msg.startsWith('font=')) {
       const enabled = msg.startsWith('font=1');
-      setClockFontStatus(enabled ? '设备正在使用自定义时钟字体。' : '设备正在使用默认七段时钟字体。');
+      const format = clockFontVersion >= 2 ? '高清 V2 40 × 80' : '兼容 V1 32 × 80';
+      setClockFontStatus(enabled ? `设备正在使用自定义时钟字体（${format}）。` : `设备正在使用默认七段时钟字体（${format}）。`);
     } else if (msg.startsWith('font_error=')) {
       setClockFontStatus(`字体操作失败：${msg.substring('font_error='.length)}`);
       clockFontBusy = false;
@@ -2323,6 +2350,7 @@ function handleNotify(value, idx) {
       rleSupport = mtuParts.includes('rle=1');
       slotStreamSupport = mtuParts.includes('slot_stream=1');
       clockFontSupport = mtuParts.includes('clock_font=1');
+      if (clockFontSupport) setClockFontFormat(mtuParts.includes('cf2=1') ? 2 : 1);
       document.getElementById('mtusize').value = mtuSize;
       addLog(`MTU 已更新为: ${mtuSize}`);
       if (rleSupport) addLog('设备已启用 RLE 压缩传输。');
