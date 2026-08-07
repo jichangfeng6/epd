@@ -1628,6 +1628,26 @@ canvas.text-placement-mode {
     margin-top: 16px;
 }
 
+.slot-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.slot-pagination[hidden] {
+    display: none;
+}
+
+.slot-pagination button {
+    width: 36px;
+    min-width: 36px;
+    padding: 7px;
+    font-size: 20px;
+    line-height: 1;
+}
+
 .slot-item {
     position: relative;
     display: grid;

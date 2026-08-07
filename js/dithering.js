@@ -30,6 +30,41 @@ const blackWhitePalette = [
   { name: "白色", r: 255, g: 255, b: 255, value: 0x01 }
 ];
 
+// ACeP display colors adapted from paperlesspaper/epdoptimize (Apache-2.0).
+// Dithering and preview use calibrated RGB. The native nibble remains the
+// Waveshare transfer contract and is applied only after quantization.
+const sevenColorPalette = [
+  { name: "Black",  r: 25,  g: 30,  b: 33,  value: 0x00 },
+  { name: "White",  r: 241, g: 241, b: 241, value: 0x01 },
+  { name: "Green",  r: 83,  g: 164, b: 40,  value: 0x02 },
+  { name: "Blue",   r: 49,  g: 49,  b: 143, value: 0x03 },
+  { name: "Red",    r: 210, g: 14,  b: 19,  value: 0x04 },
+  { name: "Yellow", r: 243, g: 207, b: 17,  value: 0x05 },
+  { name: "Orange", r: 184, g: 94,  b: 28,  value: 0x06 }
+];
+
+// No-dither chooses one ink from ideal input colors, then previews that ink
+// with the calibrated panel color above.
+const sevenColorNoDitherPalette = [
+  { r: 0,   g: 0,   b: 0,   output: sevenColorPalette[0] },
+  { r: 255, g: 255, b: 255, output: sevenColorPalette[1] },
+  { r: 0,   g: 255, b: 0,   output: sevenColorPalette[2] },
+  { r: 0,   g: 0,   b: 255, output: sevenColorPalette[3] },
+  { r: 255, g: 0,   b: 0,   output: sevenColorPalette[4] },
+  { r: 255, g: 255, b: 0,   output: sevenColorPalette[5] },
+  { r: 255, g: 160, b: 0,   output: sevenColorPalette[6] }
+];
+
+const sevenColorNeutralChroma = 14;
+const sevenColorCoolNeutralChroma = 22;
+const sevenColorGamutMappingStrength = 0.7;
+
+const sevenColorChromaticPalette = sevenColorPalette.slice(2).map(color => ({
+  color,
+  hue: getSevenColorHue(color.r, color.g, color.b),
+  luminance: getSevenColorLuminance(color.r, color.g, color.b)
+})).sort((left, right) => left.hue - right.hue);
+
 const paletteLabCache = new Map();
 
 function clampChannel(value) {
@@ -111,7 +146,9 @@ function labDistance(lab1, lab2) {
 }
 
 function getPalette(mode) {
-  if (mode === 'fourColor') {
+  if (mode === 'sevenColor') {
+    return sevenColorPalette;
+  } else if (mode === 'fourColor') {
     return fourColorPalette;
   } else if (mode === 'threeColor') {
     return threeColorPalette;
@@ -128,14 +165,125 @@ function getPaletteLab(mode) {
   return paletteLabCache.get(mode);
 }
 
+function isSevenColorNeutral(r, g, b) {
+  const lab = rgbToLab(r, g, b);
+  const chroma = Math.sqrt(lab.a * lab.a + lab.b * lab.b);
+  if (chroma <= sevenColorNeutralChroma) return true;
+
+  const hue = getSevenColorHue(r, g, b);
+  return lab.l >= 45 && chroma <= sevenColorCoolNeutralChroma && hue >= 175 && hue <= 230;
+}
+
+function getSevenColorLuminance(r, g, b) {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function getSevenColorHue(r, g, b) {
+  r /= 255;
+  g /= 255;
+  b /= 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+  if (delta === 0) return 0;
+
+  let hue;
+  if (max === r) hue = 60 * (((g - b) / delta) % 6);
+  else if (max === g) hue = 60 * ((b - r) / delta + 2);
+  else hue = 60 * ((r - g) / delta + 4);
+  return hue < 0 ? hue + 360 : hue;
+}
+
+function findSevenColorHueNeighbors(targetHue) {
+  for (let index = 0; index < sevenColorChromaticPalette.length; index++) {
+    const left = sevenColorChromaticPalette[index];
+    const right = sevenColorChromaticPalette[(index + 1) % sevenColorChromaticPalette.length];
+    const span = (right.hue - left.hue + 360) % 360;
+    const offset = (targetHue - left.hue + 360) % 360;
+    if (offset <= span) return { left, right, position: span === 0 ? 0 : offset / span };
+  }
+  return {
+    left: sevenColorChromaticPalette[0],
+    right: sevenColorChromaticPalette[0],
+    position: 0
+  };
+}
+
+function mapSevenColorToDeviceGamut(r, g, b, sourceR, sourceG, sourceB) {
+  if (isSevenColorNeutral(sourceR, sourceG, sourceB)) return { r, g, b };
+
+  const neighbors = findSevenColorHueNeighbors(getSevenColorHue(sourceR, sourceG, sourceB));
+  const position = neighbors.position * neighbors.position * (3 - 2 * neighbors.position);
+  const inverse = 1 - position;
+  const baseR = neighbors.left.color.r * inverse + neighbors.right.color.r * position;
+  const baseG = neighbors.left.color.g * inverse + neighbors.right.color.g * position;
+  const baseB = neighbors.left.color.b * inverse + neighbors.right.color.b * position;
+  const baseLuminance = neighbors.left.luminance * inverse + neighbors.right.luminance * position;
+  const targetLuminance = getSevenColorLuminance(r, g, b);
+  const neutral = targetLuminance >= baseLuminance ? sevenColorPalette[1] : sevenColorPalette[0];
+  const neutralLuminance = getSevenColorLuminance(neutral.r, neutral.g, neutral.b);
+  const range = neutralLuminance - baseLuminance;
+  const amount = Math.abs(range) > 0.001
+    ? Math.min(1, Math.max(0, (targetLuminance - baseLuminance) / range))
+    : 0;
+
+  return {
+    r: baseR + (neutral.r - baseR) * amount,
+    g: baseG + (neutral.g - baseG) * amount,
+    b: baseB + (neutral.b - baseB) * amount
+  };
+}
+
+function findClosestSevenColor(r, g, b, sourceR = r, sourceG = g, sourceB = b) {
+  let closest = sevenColorPalette[0];
+  let minDistance = Infinity;
+  const paletteLength = isSevenColorNeutral(sourceR, sourceG, sourceB)
+    ? 2
+    : sevenColorPalette.length;
+  for (let index = 0; index < paletteLength; index++) {
+    const color = sevenColorPalette[index];
+    if (color.r === r && color.g === g && color.b === b) return color;
+    const dr = r - color.r;
+    const dg = g - color.g;
+    const db = b - color.b;
+    const distance = dr * dr + dg * dg + db * db;
+    if (distance < minDistance) {
+      minDistance = distance;
+      closest = color;
+    }
+  }
+  return closest;
+}
+
+function findClosestSevenColorNoDither(r, g, b) {
+  for (const color of sevenColorPalette) {
+    if (color.r === r && color.g === g && color.b === b) return color;
+  }
+
+  let closest = sevenColorNoDitherPalette[0];
+  let minDistance = Infinity;
+  for (const color of sevenColorNoDitherPalette) {
+    const dr = r - color.r;
+    const dg = g - color.g;
+    const db = b - color.b;
+    const distance = dr * dr + dg * dg + db * db;
+    if (distance < minDistance) {
+      minDistance = distance;
+      closest = color;
+    }
+  }
+  return closest.output;
+}
+
 function findClosestColor(r, g, b, mode) {
   r = clampChannel(r);
   g = clampChannel(g);
   b = clampChannel(b);
   const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
 
-  // 蓝色特殊情况（仅限非三色、四色模式）
-  if (mode !== 'fourColor' && mode !== 'threeColor' && r < 50 && g < 150 && b > 100) {
+  // Seven-color matching uses calibrated ink appearance; transfer RGB stays native.
+  if (mode === 'sevenColor') return findClosestSevenColor(r, g, b);
+  if (mode !== 'sevenColor' && mode !== 'fourColor' && mode !== 'threeColor' && r < 50 && g < 150 && b > 100) {
     return rgbPalette[2]; // 蓝色
   }
 
@@ -566,30 +714,276 @@ function bayerDither(imageData, strength, mode) {
   return imageData;
 }
 
-function ditherImage(imageData, alg, strength, mode) {
-  const safeStrength = normalizeDitherStrength(strength);
-  switch (alg) {
-    case 'floydSteinberg':
-      return floydSteinbergDither(imageData, safeStrength, mode);
-    case 'atkinson':
-      return atkinsonDither(imageData, safeStrength, mode);
-    case 'stucki':
-      return stuckiDither(imageData, safeStrength, mode);
-    case 'jarvis':
-      return jarvisDither(imageData, safeStrength, mode);
-    case 'bayer':
-      return bayerDither(imageData, safeStrength, mode);
-    case 'none':
-    default:
-      return imageData;
+function luminance709(r, g, b) {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function histogramPercentile(histogram, count, percentile) {
+  const target = Math.max(0, Math.min(count - 1, Math.round((count - 1) * percentile)));
+  let seen = 0;
+  for (let value = 0; value < histogram.length; value++) {
+    seen += histogram[value];
+    if (seen > target) return value;
   }
+  return 255;
+}
+
+function fitEpdDynamicRange(imageData) {
+  const data = imageData.data;
+  const histogram = new Uint32Array(256);
+  let count = 0;
+
+  for (let index = 0; index < data.length; index += 4) {
+    if (data[index + 3] === 0) continue;
+    histogram[clampChannel(luminance709(data[index], data[index + 1], data[index + 2]))]++;
+    count++;
+  }
+  if (!count) return imageData;
+
+  const black = histogramPercentile(histogram, count, 0.01);
+  const white = histogramPercentile(histogram, count, 0.99);
+  const range = white - black;
+  if (range < 8) return imageData;
+
+  const strength = range < 160 ? 0.9 : range < 220 ? 0.65 : 0.25;
+  for (let index = 0; index < data.length; index += 4) {
+    const r = data[index];
+    const g = data[index + 1];
+    const b = data[index + 2];
+    const sourceLuma = luminance709(r, g, b);
+    const fittedLuma = Math.max(0, Math.min(255, (sourceLuma - black) * 255 / range));
+    const delta = (fittedLuma - sourceLuma) * strength;
+    data[index] = clampChannel(r + delta);
+    data[index + 1] = clampChannel(g + delta);
+    data[index + 2] = clampChannel(b + delta);
+  }
+  return imageData;
+}
+
+function epdOptimizeDither(imageData, strength, mode) {
+  fitEpdDynamicRange(imageData);
+  return floydSteinbergDither(imageData, strength, mode);
+}
+
+const esp32DitherMatrices = Object.freeze({
+  'floyd-steinberg': [
+    [1, 0, 7 / 16], [-1, 1, 3 / 16], [0, 1, 5 / 16], [1, 1, 1 / 16]
+  ],
+  atkinson: [
+    [1, 0, 1 / 8], [2, 0, 1 / 8], [-1, 1, 1 / 8],
+    [0, 1, 1 / 8], [1, 1, 1 / 8], [0, 2, 1 / 8]
+  ],
+  stucki: [
+    [1, 0, 8 / 42], [2, 0, 4 / 42],
+    [-2, 1, 2 / 42], [-1, 1, 4 / 42], [0, 1, 8 / 42], [1, 1, 4 / 42], [2, 1, 2 / 42],
+    [-2, 2, 1 / 42], [-1, 2, 2 / 42], [0, 2, 4 / 42], [1, 2, 2 / 42], [2, 2, 1 / 42]
+  ],
+  'jarvis-judice-ninke': [
+    [1, 0, 7 / 48], [2, 0, 5 / 48],
+    [-2, 1, 3 / 48], [-1, 1, 5 / 48], [0, 1, 7 / 48], [1, 1, 5 / 48], [2, 1, 3 / 48],
+    [-2, 2, 1 / 48], [-1, 2, 3 / 48], [0, 2, 5 / 48], [1, 2, 3 / 48], [2, 2, 1 / 48]
+  ]
+});
+
+const esp32BayerMatrix = Object.freeze([
+  [0, 32, 8, 40, 2, 34, 10, 42],
+  [48, 16, 56, 24, 50, 18, 58, 26],
+  [12, 44, 4, 36, 14, 46, 6, 38],
+  [60, 28, 52, 20, 62, 30, 54, 22],
+  [3, 35, 11, 43, 1, 33, 9, 41],
+  [51, 19, 59, 27, 49, 17, 57, 25],
+  [15, 47, 7, 39, 13, 45, 5, 37],
+  [63, 31, 55, 23, 61, 29, 53, 21]
+]);
+
+function getEsp32Palette(mode) {
+  if (mode === 'sevenColor') {
+    return sevenColorPalette;
+  }
+  if (mode === 'sixColor') {
+    return [
+      { r: 0, g: 0, b: 0 }, { r: 255, g: 255, b: 255 },
+      { r: 255, g: 255, b: 0 }, { r: 255, g: 0, b: 0 },
+      { r: 0, g: 0, b: 255 }, { r: 0, g: 255, b: 0 }
+    ];
+  }
+  if (mode === 'fourColor') {
+    return [
+      { r: 0, g: 0, b: 0 }, { r: 255, g: 255, b: 255 },
+      { r: 255, g: 255, b: 0 }, { r: 255, g: 0, b: 0 }
+    ];
+  }
+  if (mode === 'threeColor') {
+    return [{ r: 0, g: 0, b: 0 }, { r: 255, g: 255, b: 255 }, { r: 255, g: 0, b: 0 }];
+  }
+  return [{ r: 0, g: 0, b: 0 }, { r: 255, g: 255, b: 255 }];
+}
+
+function findClosestEsp32Color(r, g, b, palette, mode, sourceR = r, sourceG = g, sourceB = b) {
+  if (mode === 'sevenColor') return findClosestSevenColor(r, g, b, sourceR, sourceG, sourceB);
+  let closest = palette[0];
+  let minDistance = Infinity;
+  for (const color of palette) {
+    const dr = r - color.r;
+    const dg = g - color.g;
+    const db = b - color.b;
+    const distance = dr * dr + dg * dg + db * db;
+    if (distance < minDistance) {
+      minDistance = distance;
+      closest = color;
+    }
+  }
+  return closest;
+}
+
+function adjustEsp32Color(r, g, b, settings) {
+  const brightness = Number.isFinite(settings.brightness) ? settings.brightness : 1;
+  const contrast = Number.isFinite(settings.contrast) ? settings.contrast : 1;
+  const saturation = Number.isFinite(settings.saturation) ? settings.saturation : 1;
+  let adjustedR = (r * brightness - 128) * contrast + 128;
+  let adjustedG = (g * brightness - 128) * contrast + 128;
+  let adjustedB = (b * brightness - 128) * contrast + 128;
+  const average = (adjustedR + adjustedG + adjustedB) / 3;
+  adjustedR = average + (adjustedR - average) * saturation;
+  adjustedG = average + (adjustedG - average) * saturation;
+  adjustedB = average + (adjustedB - average) * saturation;
+  return {
+    r: Math.min(255, Math.max(0, adjustedR)),
+    g: Math.min(255, Math.max(0, adjustedG)),
+    b: Math.min(255, Math.max(0, adjustedB))
+  };
+}
+
+function applyEsp32Adjustments(imageData, settings) {
+  const data = imageData.data;
+  for (let index = 0; index < data.length; index += 4) {
+    const adjusted = adjustEsp32Color(data[index], data[index + 1], data[index + 2], settings);
+    data[index] = adjusted.r;
+    data[index + 1] = adjusted.g;
+    data[index + 2] = adjusted.b;
+  }
+  return imageData;
+}
+
+function esp32DitherImage(
+  imageData, algorithm, diffusion, mode, settings,
+  adjustmentsApplied = false, sevenColorSourceData = null
+) {
+  const data = imageData.data;
+  const width = imageData.width;
+  const height = imageData.height;
+  const palette = getEsp32Palette(mode);
+  const safeDiffusion = Math.min(1, Math.max(0, Number(diffusion) || 0));
+  const useSevenColor = mode === 'sevenColor';
+  const sourceData = useSevenColor
+    ? (sevenColorSourceData || new Uint8ClampedArray(data))
+    : null;
+  if (useSevenColor && !adjustmentsApplied) applyEsp32Adjustments(imageData, settings);
+  const useSevenColorGamutMapping = useSevenColor && algorithm !== 'none';
+  const workingData = useSevenColorGamutMapping ? new Float32Array(data) : data;
+  if (useSevenColorGamutMapping) {
+    for (let index = 0; index < workingData.length; index += 4) {
+      const mapped = mapSevenColorToDeviceGamut(
+        workingData[index], workingData[index + 1], workingData[index + 2],
+        sourceData[index], sourceData[index + 1], sourceData[index + 2]
+      );
+      workingData[index] += (mapped.r - workingData[index]) * sevenColorGamutMappingStrength;
+      workingData[index + 1] += (mapped.g - workingData[index + 1]) * sevenColorGamutMappingStrength;
+      workingData[index + 2] += (mapped.b - workingData[index + 2]) * sevenColorGamutMappingStrength;
+    }
+  }
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = (y * width + x) * 4;
+      const adjusted = adjustmentsApplied || useSevenColor
+        ? { r: workingData[index], g: workingData[index + 1], b: workingData[index + 2] }
+        : adjustEsp32Color(data[index], data[index + 1], data[index + 2], settings);
+      const sourceR = useSevenColor ? sourceData[index] : adjusted.r;
+      const sourceG = useSevenColor ? sourceData[index + 1] : adjusted.g;
+      const sourceB = useSevenColor ? sourceData[index + 2] : adjusted.b;
+
+      if (algorithm === 'bayer') {
+        const threshold = esp32BayerMatrix[y % 8][x % 8] * 255 / 64;
+        const gray = 0.299 * adjusted.r + 0.587 * adjusted.g + 0.114 * adjusted.b;
+        const offset = (gray - threshold) * safeDiffusion;
+        const color = mode === 'blackWhiteColor'
+          ? palette[gray >= threshold ? 1 : 0]
+          : findClosestEsp32Color(
+            adjusted.r + offset, adjusted.g + offset, adjusted.b + offset,
+            palette, mode, sourceR, sourceG, sourceB
+          );
+        data[index] = color.r;
+        data[index + 1] = color.g;
+        data[index + 2] = color.b;
+        continue;
+      }
+
+      const color = useSevenColor && algorithm === 'none'
+        ? findClosestSevenColorNoDither(adjusted.r, adjusted.g, adjusted.b)
+        : findClosestEsp32Color(
+          adjusted.r, adjusted.g, adjusted.b, palette, mode, sourceR, sourceG, sourceB
+        );
+      data[index] = color.r;
+      data[index + 1] = color.g;
+      data[index + 2] = color.b;
+      if (algorithm === 'none') continue;
+
+      const matrix = esp32DitherMatrices[algorithm] || esp32DitherMatrices['floyd-steinberg'];
+      const errorR = adjusted.r - color.r;
+      const errorG = adjusted.g - color.g;
+      const errorB = adjusted.b - color.b;
+      for (const [offsetX, offsetY, weight] of matrix) {
+        const nextX = x + offsetX;
+        const nextY = y + offsetY;
+        if (nextX < 0 || nextX >= width || nextY < 0 || nextY >= height) continue;
+        const nextIndex = (nextY * width + nextX) * 4;
+        const factor = weight * safeDiffusion;
+        workingData[nextIndex] += errorR * factor;
+        workingData[nextIndex + 1] += errorG * factor;
+        workingData[nextIndex + 2] += errorB * factor;
+      }
+    }
+  }
+  return imageData;
+}
+
+function ditherImage(imageData, alg, strength, mode, adjustments = {}) {
+  if (alg === 'epdOptimize') {
+    const sourceData = mode === 'sevenColor' ? new Uint8ClampedArray(imageData.data) : null;
+    applyEsp32Adjustments(imageData, adjustments);
+    if (mode === 'sevenColor') {
+      fitEpdDynamicRange(imageData);
+      return esp32DitherImage(
+        imageData, 'floyd-steinberg', normalizeDitherStrength(strength),
+        mode, adjustments, true, sourceData
+      );
+    }
+    return epdOptimizeDither(imageData, normalizeDitherStrength(strength), mode);
+  }
+  const algorithmAliases = {
+    floydSteinberg: 'floyd-steinberg',
+    jarvis: 'jarvis-judice-ninke'
+  };
+  return esp32DitherImage(imageData, algorithmAliases[alg] || alg, strength, mode, adjustments);
 }
 
 function decodeProcessedData(processedData, width, height, mode) {
   const imageData = new ImageData(width, height);
   const data = imageData.data;
 
-  if (mode === 'sixColor') {
+  if (mode === 'sevenColor') {
+    for (let pixel = 0; pixel < width * height; pixel++) {
+      const packed = processedData[pixel >> 1];
+      const value = (pixel & 1) === 0 ? packed >> 4 : packed & 0x0F;
+      const color = sevenColorPalette.find(item => item.value === value) || sevenColorPalette[1];
+      const index = pixel * 4;
+      data[index] = color.r;
+      data[index + 1] = color.g;
+      data[index + 2] = color.b;
+      data[index + 3] = 255;
+    }
+  } else if (mode === 'sixColor') {
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const newIndex = (x * height) + (height - 1 - y);
@@ -673,7 +1067,14 @@ function processImageData(imageData, mode) {
 
   let processedData;
 
-  if (mode === 'sixColor') {
+  if (mode === 'sevenColor') {
+    processedData = new Uint8Array(Math.ceil(width * height / 2));
+    for (let pixel = 0; pixel < width * height; pixel++) {
+      const index = pixel * 4;
+      const closest = findClosestColor(data[index], data[index + 1], data[index + 2], mode);
+      processedData[pixel >> 1] |= closest.value << ((pixel & 1) === 0 ? 4 : 0);
+    }
+  } else if (mode === 'sixColor') {
     processedData = new Uint8Array(width * height);
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {

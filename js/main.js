@@ -8,11 +8,12 @@ let currentPinsValue = '';
 let ditherSourceImageData = null;
 let ditherPreviewActive = false;
 let pageExitDisconnecting = false;
-let slotState = { count: 0, usedMask: 0, selected: null, fingerprints: [] };
+let slotState = { count: 0, pageStart: 0, pageCount: 0, usedMask: 0, selected: null, flashSize: 0, fingerprints: [] };
 let slotReadState = null;
 let slotImageCache = new Map();
 let slotImageCacheScope = '';
 let slotPreviewPending = new Set();
+let slotProtocolV2 = false;
 let rleSupport = false;
 let slotStreamSupport = false;
 let clockFontSupport = false;
@@ -23,6 +24,7 @@ let imageTransferActive = false;
 let imageRefreshPending = false;
 let imageRefreshTimer = null;
 let imageCompletionKind = 'refresh';
+let imagePrepareWait = null;
 let slotActionPending = false;
 let slotActionTimer = null;
 let slotReadTimer = null;
@@ -44,6 +46,7 @@ const DEFAULT_SLOT_READ_RAW_CHUNK_SIZE = 256;
 const SLOT_READ_TIMEOUT_MS = 5000;
 const SLOT_READ_INFO_TIMEOUT_MS = 8000;
 const SLOT_CHUNK_MAX_RETRIES = 2;
+const SLOT_PAGE_SIZE = 18;
 const IMAGE_REFRESH_TIMEOUT_MS = 95000;
 const SLOT_IMAGE_CACHE_PREFIX = 'epd-slot-preview-v2:';
 const SLOT_PREVIEW_MAX_EDGE = 480;
@@ -117,7 +120,7 @@ const EpdCmd = {
 const LEGACY_EPD_CONFIG_SIZES = [14, 15, 16];
 const EPD_CONFIG_SIZE = 19;
 const LED_CONTROL_MIN_VERSION = 0x40;
-let firmwareVersion = { label: '未知', ledControl: false, outdated: true };
+let firmwareVersion = { label: '未知', ledControl: false, directImagePrepare: false, outdated: true };
 
 const canvasSizes = [
   { name: '1.54_152_152', width: 152, height: 152 },
@@ -136,6 +139,7 @@ const canvasSizes = [
   { name: '3.87_800_480', width: 800, height: 480 },
   { name: '9.7_960_680', width: 960, height: 680 },
   { name: '4.2_400_300', width: 400, height: 300 },
+  { name: '5.65_600_448', width: 600, height: 448 },
   { name: '5.79_792_272', width: 792, height: 272 },
   { name: '5.83_600_448', width: 600, height: 448 },
   { name: '5.83_648_480', width: 648, height: 480 },
@@ -170,13 +174,19 @@ function parseFirmwareVersion(value) {
     const major = parseInt(semantic[1], 10);
     const minor = parseInt(semantic[2], 10);
     const currentOrNewer = major > 1 || (major === 1 && minor >= 8);
-    return { label: text, ledControl: currentOrNewer, outdated: !currentOrNewer };
+    return {
+      label: text,
+      ledControl: currentOrNewer,
+      directImagePrepare: major > 1 || (major === 1 && minor >= 36),
+      outdated: !currentOrNewer,
+    };
   }
 
   const legacy = bytes.length > 0 ? bytes[0] : 0;
   return {
     label: `0x${legacy.toString(16)}`,
     ledControl: legacy >= LED_CONTROL_MIN_VERSION,
+    directImagePrepare: false,
     outdated: legacy < 0x16,
   };
 }
@@ -191,22 +201,24 @@ function resetVariables(options = {}) {
   gattServer = null;
   epdService = null;
   epdCharacteristic = null;
-  firmwareVersion = { label: '未知', ledControl: false, outdated: true };
+  firmwareVersion = { label: '未知', ledControl: false, directImagePrepare: false, outdated: true };
   msgIndex = 0;
   bleWriteChain = Promise.resolve();
   currentPinsValue = '';
-  slotState = { count: 0, usedMask: 0, selected: null, fingerprints: [] };
+  slotState = { count: 0, pageStart: 0, pageCount: 0, usedMask: 0, selected: null, flashSize: 0, fingerprints: [] };
   if (slotReadTimer != null) clearTimeout(slotReadTimer);
   slotReadTimer = null;
   slotReadState = null;
   slotImageCache = new Map();
   slotImageCacheScope = '';
+  slotProtocolV2 = false;
   slotPreviewPending = new Set();
   rleSupport = false;
   slotStreamSupport = false;
   clockFontSupport = false;
   clockFontBusy = false;
   imageTransferActive = false;
+  cancelImagePrepareWait();
   imageRefreshPending = false;
   imageCompletionKind = 'refresh';
   if (imageRefreshTimer != null) clearTimeout(imageRefreshTimer);
@@ -573,7 +585,8 @@ function cancelOtaUpdate() {
 }
 
 function slotColorName(colorId) {
-  return colorId === 2 ? '黑白' : colorId === 3 ? '黑白红' : colorId === 4 ? '黑白红黄' : '未知';
+  return colorId === 2 ? '黑白' : colorId === 3 ? '黑白红' : colorId === 4 ? '黑白红黄' :
+    colorId === 7 ? '七色' : '未知';
 }
 
 function rleEncode(data, maxLiteral = 128) {
@@ -687,6 +700,40 @@ function normalizeSlotFingerprint(value) {
   return typeof value === 'string' && /^[0-9a-f]{8}$/i.test(value) ? value.toUpperCase() : null;
 }
 
+function encodeUint32LE(value) {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+  return bytes;
+}
+
+function encodeSlotAction(action, slot) {
+  if (!slotProtocolV2) return new Uint8Array([action, slot & 0xFF]);
+  const payload = new Uint8Array(5);
+  payload[0] = action;
+  payload.set(encodeUint32LE(slot), 1);
+  return payload;
+}
+
+function encodeSlotIndex(slot) {
+  return slotProtocolV2 ? encodeUint32LE(slot) : new Uint8Array([slot & 0xFF]);
+}
+
+function isSlotUsed(slot) {
+  const offset = slot - slotState.pageStart;
+  return offset >= 0 && offset < slotState.pageCount && (slotState.usedMask & (1 << offset)) !== 0;
+}
+
+function slotFingerprint(slot) {
+  const offset = slot - slotState.pageStart;
+  return offset >= 0 && offset < slotState.pageCount ? slotState.fingerprints[offset] || null : null;
+}
+
+function formatFlashSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '未识别 Flash';
+  if (bytes >= 1024 * 1024) return `${Number((bytes / (1024 * 1024)).toFixed(2))} MB Flash`;
+  return `${Number((bytes / 1024).toFixed(1))} KB Flash`;
+}
+
 function slotCacheMatchesFingerprint(entry, fingerprint) {
   return fingerprint == null || normalizeSlotFingerprint(entry && entry.fingerprint) === fingerprint;
 }
@@ -698,10 +745,11 @@ function loadSlotImageCache() {
     slotImageCacheScope = scope;
   }
 
-  for (let slot = 0; slot < slotState.count; slot++) {
-    const used = (slotState.usedMask & (1 << slot)) !== 0;
+  const pageEnd = slotState.pageStart + slotState.pageCount;
+  for (let slot = slotState.pageStart; slot < pageEnd; slot++) {
+    const used = isSlotUsed(slot);
     const pending = slotPreviewPending.has(slot);
-    const fingerprint = slotState.fingerprints[slot] || null;
+    const fingerprint = slotFingerprint(slot);
     let staleCacheRemoved = false;
     if (!used && !pending) {
       removeSlotImageCache(slot);
@@ -781,7 +829,7 @@ function cacheCurrentSlotPreview(slot, processedData, mode) {
       ? ditherSourceImageData
       : ctx.getImageData(0, 0, canvas.width, canvas.height);
     const dataUrl = createSlotPreviewDataUrl(sourceImageData);
-    const colorId = mode === 'blackWhiteColor' ? 2 : mode === 'threeColor' ? 3 : 4;
+    const colorId = mode === 'sevenColor' ? 7 : mode === 'blackWhiteColor' ? 2 : mode === 'threeColor' ? 3 : 4;
     slotPreviewPending.add(slot);
     saveSlotImageCache(slot, {
       width: canvas.width,
@@ -810,7 +858,7 @@ function removeSlotImageCache(slot) {
 }
 
 function clearAllSlotImageCaches() {
-  for (let slot = 0; slot < Math.max(slotState.count, 20); slot++) removeSlotImageCache(slot);
+  for (const slot of slotImageCache.keys()) removeSlotImageCache(slot);
   slotImageCache.clear();
 }
 
@@ -818,9 +866,11 @@ function renderSlotGrid(forceDisabled = imageTransferActive || slotActionPending
   const grid = document.getElementById('slotGrid');
   const summary = document.getElementById('slotSummary');
   const hint = document.getElementById('slotHint');
-  if (!grid || !summary || !hint) return;
+  const pagination = document.getElementById('slotPagination');
+  if (!grid || !summary || !hint || !pagination) return;
 
   grid.replaceChildren();
+  pagination.hidden = true;
   if (!isBleConnected()) {
     summary.textContent = '连接设备后读取槽位';
     hint.textContent = '图片保存在设备外置 Flash 中';
@@ -834,8 +884,9 @@ function renderSlotGrid(forceDisabled = imageTransferActive || slotActionPending
   }
 
   let usedCount = 0;
-  for (let slot = 0; slot < slotState.count; slot++) {
-    const used = (slotState.usedMask & (1 << slot)) !== 0;
+  const pageEnd = slotState.pageStart + slotState.pageCount;
+  for (let slot = slotState.pageStart; slot < pageEnd; slot++) {
+    const used = isSlotUsed(slot);
     const cached = slotImageCache.get(slot) || null;
     const previewPending = !used && cached && slotPreviewPending.has(slot);
     if (used) usedCount++;
@@ -910,14 +961,25 @@ function renderSlotGrid(forceDisabled = imageTransferActive || slotActionPending
     grid.appendChild(item);
   }
 
-  summary.textContent = `${slotState.count} 个槽位，已使用 ${usedCount} 个`;
-  hint.textContent = '“存入”仅保存到设备，不刷新屏幕';
+  const page = slotProtocolV2 ? Math.floor(slotState.pageStart / SLOT_PAGE_SIZE) + 1 : 1;
+  const pages = slotProtocolV2 ? Math.ceil(slotState.count / SLOT_PAGE_SIZE) : 1;
+  summary.textContent = `${formatFlashSize(slotState.flashSize)} · ${slotState.count} 个槽位`;
+  hint.textContent = `${pages > 1 ? `第 ${page}/${pages} 页 · ` : ''}本页已使用 ${usedCount} 个 · “存入”仅保存到设备，不刷新屏幕`;
+  pagination.hidden = pages <= 1;
+  document.getElementById('slotPageStatus').textContent = `${page} / ${pages}`;
+  document.getElementById('slotPrevPage').disabled = forceDisabled || slotState.pageStart === 0;
+  document.getElementById('slotNextPage').disabled = forceDisabled || pageEnd >= slotState.count;
 }
 
-async function refreshSlots() {
+async function refreshSlots(start = slotState.pageStart) {
   if (!isBleConnected()) return;
   addLog('正在读取图片槽位...');
-  await write(EpdCmd.GET_SLOTS);
+  await write(EpdCmd.GET_SLOTS, encodeUint32LE(Math.max(0, start)));
+}
+
+async function changeSlotPage(direction) {
+  const start = Math.max(0, Math.min(slotState.count - 1, slotState.pageStart + direction * SLOT_PAGE_SIZE));
+  await refreshSlots(start);
 }
 
 function applySlotsMessage(message) {
@@ -926,6 +988,25 @@ function applySlotsMessage(message) {
   if (!countMatch || parts.length < 2 || !/^(?:0x[0-9a-f]+|\d+)$/i.test(parts[1])) return false;
 
   const count = parseInt(countMatch[1], 10);
+  const dynamicFormat = parts.length >= 6 && parts.slice(1, 6).every((part) => /^\d+$/.test(part));
+  if (dynamicFormat) {
+    slotProtocolV2 = true;
+    const pageStart = parseInt(parts[1], 10);
+    const pageCount = parseInt(parts[2], 10);
+    const usedMask = Number(parts[3]);
+    const selected = parseInt(parts[4], 10);
+    const flashSize = parseInt(parts[5], 10);
+    slotState = {
+      count,
+      pageStart,
+      pageCount,
+      usedMask,
+      selected,
+      flashSize,
+      fingerprints: parts.slice(6, 6 + pageCount).map(normalizeSlotFingerprint)
+    };
+  } else {
+  slotProtocolV2 = false;
   let fingerprintStart = 2;
   let selected = null;
   if (parts[2] != null && /^\d+$/.test(parts[2])) {
@@ -936,10 +1017,14 @@ function applySlotsMessage(message) {
     .map(normalizeSlotFingerprint);
   slotState = {
     count,
+    pageStart: 0,
+    pageCount: count,
     usedMask: Number(parts[1]),
     selected,
+    flashSize: 0,
     fingerprints
   };
+  }
   loadSlotImageCache();
   const eraseAllCompleted = slotEraseAllPending && slotState.usedMask === 0;
   if (slotEraseAllPending && !eraseAllCompleted) {
@@ -967,7 +1052,7 @@ async function saveImageToSlot(slot) {
     addLog(`槽位 ${slot + 1} 未存入：尚未选择图片。`);
     return;
   }
-  const used = (slotState.usedMask & (1 << slot)) !== 0;
+  const used = isSlotUsed(slot);
   if (used && !confirm(`槽位 ${slot + 1} 已有图片，确认覆盖？`)) return;
   const refreshAfterSave = document.getElementById('slotRefreshAfterSave').checked;
   await sendimg({ slot, refreshAfterSave });
@@ -977,7 +1062,7 @@ async function freeImageSlot(slot) {
   if (imageTransferActive || slotActionPending) return;
   if (!confirm(`确认删除槽位 ${slot + 1} 的图片？`)) return;
   setSlotActionPending(true);
-  if (await write(EpdCmd.FREE_SLOT, new Uint8Array([slot]))) {
+  if (await write(EpdCmd.FREE_SLOT, encodeSlotIndex(slot))) {
     removeSlotImageCache(slot);
     renderSlotGrid(true);
     addLog(`槽位 ${slot + 1} 删除命令已发送。`);
@@ -987,7 +1072,7 @@ async function freeImageSlot(slot) {
 }
 
 async function freeAllImageSlots() {
-  if (imageTransferActive || slotActionPending || slotReadState || slotState.usedMask === 0) return;
+  if (imageTransferActive || slotActionPending || slotReadState || slotState.count === 0) return;
   if (!confirm('确认擦除全部图片槽位？所有已保存图片都将永久删除，此操作不可恢复。')) return;
 
   slotEraseAllPending = true;
@@ -995,7 +1080,7 @@ async function freeAllImageSlots() {
   const status = document.getElementById('slotReadStatus');
   status.hidden = false;
   status.textContent = '正在擦除全部图片槽位，请勿断开连接...';
-  if (await write(EpdCmd.FREE_SLOT, new Uint8Array([0xFF]))) {
+  if (await write(EpdCmd.FREE_SLOT, encodeSlotIndex(0xFFFFFFFF))) {
     addLog('全部图片槽位擦除命令已发送。');
   } else {
     slotEraseAllPending = false;
@@ -1007,7 +1092,7 @@ async function freeAllImageSlots() {
 async function displayImageSlot(slot) {
   if (imageTransferActive || slotActionPending) return;
   setSlotActionPending(true);
-  if (await write(EpdCmd.SET_SLOT, new Uint8Array([1, slot]))) {
+  if (await write(EpdCmd.SET_SLOT, encodeSlotAction(1, slot))) {
     addLog(`已请求设备显示槽位 ${slot + 1}。`);
   } else {
     setSlotActionPending(false);
@@ -1036,6 +1121,39 @@ function cancelImageRefreshWait() {
   imageRefreshPending = false;
 }
 
+function cancelImagePrepareWait() {
+  if (imagePrepareWait == null) return false;
+  clearTimeout(imagePrepareWait.timer);
+  const resolve = imagePrepareWait.resolve;
+  imagePrepareWait = null;
+  resolve(false);
+  return true;
+}
+
+function startImagePrepareWait() {
+  cancelImagePrepareWait();
+  return new Promise(resolve => {
+    const wait = { resolve, timer: null };
+    wait.timer = setTimeout(() => {
+      if (imagePrepareWait !== wait) return;
+      imagePrepareWait = null;
+      addLog('5.65寸屏幕初始化完成通知超时。', '', 'error');
+      resolve(false);
+    }, IMAGE_REFRESH_TIMEOUT_MS);
+    imagePrepareWait = wait;
+  });
+}
+
+function completeImagePrepare() {
+  if (imagePrepareWait == null) return false;
+  clearTimeout(imagePrepareWait.timer);
+  const resolve = imagePrepareWait.resolve;
+  imagePrepareWait = null;
+  resolve(true);
+  addLog('5.65寸屏幕初始化完成，继续传输。');
+  return true;
+}
+
 function startImageRefreshWait(kind = 'refresh') {
   cancelImageRefreshWait();
   imageCompletionKind = kind;
@@ -1055,14 +1173,16 @@ function startImageRefreshWait(kind = 'refresh') {
 function completeImageRefresh() {
   if (!imageRefreshPending) return false;
 
+  const completionKind = imageCompletionKind;
   cancelImageRefreshWait();
   imageTransferActive = false;
   updateButtonStatus();
   const totalTime = (new Date().getTime() - startTime) / 1000.0;
-  const action = imageCompletionKind === 'slot' ? '槽位保存' : '屏幕刷新';
+  const action = completionKind === 'slot' ? '槽位保存' : '屏幕刷新';
   setStatus(`${action}完成！总耗时: ${totalTime}s`);
   addLog(`${action}完成，可以继续操作。总耗时: ${totalTime}s`);
   imageCompletionKind = 'refresh';
+  if (completionKind === 'slot') void refreshSlots();
   const status = document.getElementById('status');
   setTimeout(() => {
     status.parentElement.style.display = 'none';
@@ -1071,7 +1191,7 @@ function completeImageRefresh() {
 }
 
 async function startSlotSlide(randomMode = false) {
-  if (slotState.usedMask === 0) {
+  if (slotState.count === 0) {
     alert('请先存入至少一张图片，再启动轮播。');
     addLog('轮播未启动：没有可用的图片槽。');
     return false;
@@ -1132,7 +1252,7 @@ async function requestSlotImageInfo(state) {
     }
   }, SLOT_READ_INFO_TIMEOUT_MS);
 
-  if (!await write(EpdCmd.GET_IMAGE, new Uint8Array([state.slot]), false) && slotReadState === state) {
+  if (!await write(EpdCmd.GET_IMAGE, encodeSlotIndex(state.slot), false) && slotReadState === state) {
     if (state.infoAttempts < 2) {
       addLog('读取命令发送失败，正在重试。');
       void requestSlotImageInfo(state);
@@ -1194,7 +1314,10 @@ async function startSlotImageStream() {
   state.nextChunkIndex = 0;
   state.expectedChunk = null;
   armSlotChunkTimeout(0);
-  if (!await write(EpdCmd.GET_IMAGE, new Uint8Array([state.slot, 1]), false) && slotReadState === state) {
+  const request = new Uint8Array(slotProtocolV2 ? 5 : 2);
+  request.set(encodeSlotIndex(state.slot));
+  request[request.length - 1] = 1;
+  if (!await write(EpdCmd.GET_IMAGE, request, false) && slotReadState === state) {
     failSlotImageRead('连续读取命令发送失败。');
   }
 }
@@ -1207,7 +1330,10 @@ async function requestSlotChunk(index, retry = false) {
   state.nextChunkIndex = index;
   state.expectedChunk = null;
   armSlotChunkTimeout(index);
-  const request = new Uint8Array([state.slot, (index >> 8) & 0xFF, index & 0xFF]);
+  const request = new Uint8Array(slotProtocolV2 ? 6 : 3);
+  request.set(encodeSlotIndex(state.slot));
+  request[request.length - 2] = (index >> 8) & 0xFF;
+  request[request.length - 1] = index & 0xFF;
   if (!await write(EpdCmd.GET_IMAGE, request, false) && slotReadState === state &&
     state.nextChunkIndex === index) {
     retrySlotChunk(index, '请求失败');
@@ -1457,7 +1583,7 @@ function finishSlotImageRead() {
         colorId: meta.colorId,
         dataUrl: createSlotPreviewDataUrl(imageData),
         previewKind: 'device',
-        fingerprint: slotState.fingerprints[meta.slot] || null,
+        fingerprint: slotFingerprint(meta.slot),
         savedAt: new Date().getTime()
       });
     }
@@ -1477,7 +1603,7 @@ function finishSlotImageRead() {
   }
 }
 
-async function writeImage(data, step = 'bw') {
+async function writeImage(data, step = 'bw', waitForPrepare = false) {
   const chunkSize = parseInt(document.getElementById('mtusize').value, 10) - 2;
   const interleavedCount = parseInt(document.getElementById('interleavedcount').value, 10);
 
@@ -1495,12 +1621,18 @@ async function writeImage(data, step = 'bw') {
   const transferSize = useRle ? compressedSize : rawData.length;
   let noReplyCount = interleavedCount;
   let nextLogPercent = 10;
+  let preparePromise = null;
 
   if (useRle) addLog(`${stepName} RLE 压缩：${rawData.length} → ${compressedSize} 字节 (${(compressedSize * 100 / rawData.length).toFixed(1)}%)`);
   addLog(`${stepName}开始传输：${transferSize} 字节，共 ${count} 包。`, '⇑');
 
   for (let chunkIdx = 0; chunkIdx < count; chunkIdx++) {
     if (displayErrorActive) return false;
+    if (chunkIdx === 0 && waitForPrepare) {
+      preparePromise = startImagePrepareWait();
+      setStatus('5.65寸屏幕正在初始化...');
+      addLog('5.65寸屏幕开始初始化，完成后自动继续传输。');
+    }
     const offset = chunkIdx * chunkSize;
     const chunk = useRle ? rleChunks[chunkIdx] : rawData.slice(offset, offset + chunkSize);
     const currentTime = (new Date().getTime() - startTime) / 1000.0;
@@ -1521,6 +1653,8 @@ async function writeImage(data, step = 'bw') {
       noReplyCount = interleavedCount;
     }
 
+    if (chunkIdx === 0 && preparePromise && !await preparePromise) return false;
+
     const percent = Math.floor((chunkIdx + 1) * 100 / count);
     if (percent >= nextLogPercent || chunkIdx + 1 === count) {
       addLog(`${stepName}传输进度：${percent}% (${chunkIdx + 1}/${count} 包)`, '⇑');
@@ -1531,14 +1665,22 @@ async function writeImage(data, step = 'bw') {
   return true;
 }
 
-async function setDriver() {
+async function handleDriverChange() {
+  updateDitcherOptions();
+  if (!isBleConnected()) return;
+  await setDriver({ updateOptions: false });
+}
+
+async function setDriver(options = {}) {
   updateButtonStatus(true);
+  const driverSelect = document.getElementById("epddriver");
+  driverSelect.disabled = true;
 
   try {
-    updateDitcherOptions();
+    if (options.updateOptions !== false) updateDitcherOptions();
 
     const pins = document.getElementById("epdpins").value.trim().toLowerCase();
-    const driver = document.getElementById("epddriver").value;
+    const driver = driverSelect.value;
 
     if (pins !== currentPinsValue) {
       if (!await write(EpdCmd.SET_PINS, pins, true)) return;
@@ -1549,7 +1691,9 @@ async function setDriver() {
     if (!await write(EpdCmd.INIT, driver, true)) return;
 
     addLog("驱动已更新。");
+    await refreshSlots(0);
   } finally {
+    driverSelect.disabled = false;
     updateButtonStatus();
   }
 }
@@ -1947,11 +2091,13 @@ async function sendimg(options = {}) {
   imageTransferActive = true;
   updateButtonStatus();
   const targetSlot = Number.isInteger(options.slot) ? options.slot : null;
+  const directPrepare = targetSlot == null &&
+    epdDriverSelect.value.toLowerCase() === '1a' && firmwareVersion.directImagePrepare;
   const refreshAfterSave = targetSlot != null && options.refreshAfterSave === true;
   if (targetSlot != null) {
     cacheCurrentSlotPreview(targetSlot, processedData, ditherMode);
     if (targetSlot < 0 || targetSlot >= slotState.count ||
-      !await write(EpdCmd.SET_SLOT, new Uint8Array([0, targetSlot]))) {
+      !await write(EpdCmd.SET_SLOT, encodeSlotAction(0, targetSlot))) {
       addLog('槽位写入准备失败。');
       removeSlotImageCache(targetSlot);
       imageTransferActive = false;
@@ -1963,11 +2109,13 @@ async function sendimg(options = {}) {
 
   let transferOk = true;
 
-  if (ditherMode === 'fourColor') {
+  if (ditherMode === 'sevenColor') {
+    transferOk = await writeImage(processedData, 'bw', directPrepare);
+  } else if (ditherMode === 'fourColor') {
     const useGDEM037F51 = isGDEM037F51Driver(epdDriverSelect);
     const imagePayload = useGDEM037F51 ? convertGDEM037F51(processedData, canvas.width, canvas.height) : processedData;
     if (useGDEM037F51) addLog('3.7BWRY 图像数据已按原生颜色码重排为 240x416');
-    transferOk = await writeImage(imagePayload, 'bw');
+    transferOk = await writeImage(imagePayload, 'bw', directPrepare);
   } else if (ditherMode === 'threeColor') {
     const halfLength = Math.floor(processedData.length / 2);
     let blackWhiteData = processedData.slice(0, halfLength);
@@ -1983,17 +2131,17 @@ async function sendimg(options = {}) {
       addLog('2.13寸图像数据已按 128x250 显存旋转并应用 X + 8 px 偏移');
     }
     if (epdDriverSelect.value === '08' || epdDriverSelect.value === '09') {
-      transferOk = await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw');
+      transferOk = await writeImage(convertUC8159(blackWhiteData, redWhiteData), 'bw', directPrepare);
     } else {
-      transferOk = await writeImage(blackWhiteData, 'bw');
+      transferOk = await writeImage(blackWhiteData, 'bw', directPrepare);
       if (transferOk) transferOk = await writeImage(redWhiteData, 'red');
     }
   } else if (ditherMode === 'blackWhiteColor') {
     if (epdDriverSelect.value === '08' || epdDriverSelect.value === '09') {
       const emptyData = new Uint8Array(processedData.length).fill(0xFF);
-      transferOk = await writeImage(convertUC8159(processedData, emptyData), 'bw');
+      transferOk = await writeImage(convertUC8159(processedData, emptyData), 'bw', directPrepare);
     } else {
-      transferOk = await writeImage(processedData, 'bw');
+      transferOk = await writeImage(processedData, 'bw', directPrepare);
     }
   } else {
     addLog("当前固件不支持此颜色模式。");
@@ -2004,7 +2152,7 @@ async function sendimg(options = {}) {
   }
 
   if (!transferOk) {
-    if (targetSlot != null) await write(EpdCmd.SET_SLOT, new Uint8Array([0, slotState.count]));
+    if (targetSlot != null) await write(EpdCmd.SET_SLOT, encodeSlotAction(0, 0xFFFFFFFF));
     if (targetSlot != null) removeSlotImageCache(targetSlot);
     setStatus('图片发送失败。');
     imageTransferActive = false;
@@ -2020,7 +2168,7 @@ async function sendimg(options = {}) {
   setStatus(savingSlot ? '图片数据发送完成，正在保存槽位...' : '图片数据发送完成，正在刷新屏幕...');
   startImageRefreshWait(targetSlot != null ? 'slot' : 'refresh');
   const completionSent = savingSlot
-    ? await write(EpdCmd.SET_SLOT, new Uint8Array([refreshAfterSave ? 3 : 2, targetSlot]))
+    ? await write(EpdCmd.SET_SLOT, encodeSlotAction(refreshAfterSave ? 3 : 2, targetSlot))
     : await write(EpdCmd.REFRESH);
   if (!completionSent) {
     cancelImageRefreshWait();
@@ -2097,9 +2245,9 @@ function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPen
   });
   if (ledColorDisabled) closeLedColorPopover();
   document.getElementById("refreshSlotsButton").disabled = status;
-  document.getElementById("eraseAllSlotsButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
-  document.getElementById("startSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
-  document.getElementById("randomSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
+  document.getElementById("eraseAllSlotsButton").disabled = status || slotState.count === 0 ? 'disabled' : null;
+  document.getElementById("startSlotSlideButton").disabled = status || slotState.count === 0 ? 'disabled' : null;
+  document.getElementById("randomSlotSlideButton").disabled = status || slotState.count === 0 ? 'disabled' : null;
   document.getElementById("stopSlotSlideButton").disabled = status;
   document.getElementById('clockFontUploadButton').disabled = Boolean(status) || !clockFontSupport;
   document.getElementById('clockFontEraseButton').disabled = Boolean(status) || !clockFontSupport;
@@ -2267,6 +2415,7 @@ function handleDisplayError(code) {
     : '设备正在执行其他显示操作，请稍后重试。';
 
   displayErrorActive = busyTimeout;
+  cancelImagePrepareWait();
   cancelImageRefreshWait();
   imageTransferActive = false;
   if (slotActionPending) setSlotActionPending(false);
@@ -2318,7 +2467,7 @@ function handleNotify(value, idx) {
     if (applySlotsMessage(msg)) {
       addLog('图片槽位状态已更新。');
     } else if (msg === 'ready=1') {
-      completeImageRefresh();
+      if (!completeImagePrepare()) completeImageRefresh();
     } else if (beginSlotImageRead(msg)) {
       addLog('开始接收槽位图片。');
     } else if (beginSlotChunk(msg)) {
@@ -2389,7 +2538,7 @@ async function connect() {
     addLog(`固件版本: ${firmwareVersion.label}`);
   } catch (e) {
     console.error(e);
-    firmwareVersion = { label: '未知', ledControl: false, outdated: true };
+    firmwareVersion = { label: '未知', ledControl: false, directImagePrepare: false, outdated: true };
   }
 
   if (firmwareVersion.outdated) {
@@ -2598,16 +2747,12 @@ function getDitherSettings() {
   };
 }
 
-function prepareDitherImageData(sourceImageData, settings) {
-  const imageData = new ImageData(
+function prepareDitherImageData(sourceImageData) {
+  return new ImageData(
     new Uint8ClampedArray(sourceImageData.data),
     sourceImageData.width,
     sourceImageData.height
   );
-
-  adjustBrightnessSaturation(imageData, settings.brightness, settings.saturation);
-  adjustContrast(imageData, settings.contrast);
-  return imageData;
 }
 
 function processCanvasImageData() {
@@ -2617,8 +2762,8 @@ function processCanvasImageData() {
   }
   const sourceImageData = cloneImageData(ditherSourceImageData);
   if (calendarStyleImageActive) return processImageData(sourceImageData, settings.mode);
-  const imageData = prepareDitherImageData(sourceImageData, settings);
-  return processImageData(ditherImage(imageData, settings.alg, settings.strength, settings.mode), settings.mode);
+  const imageData = prepareDitherImageData(sourceImageData);
+  return processImageData(ditherImage(imageData, settings.alg, settings.strength, settings.mode, settings), settings.mode);
 }
 
 function convertDithering() {
@@ -2649,10 +2794,10 @@ function setDitherAdjustment(id, value, digits) {
 }
 
 function resetDitherAdjustments() {
-  setDitherAdjustment('ditherStrength', 1.0, 1);
-  setDitherAdjustment('ditherContrast', 1.2, 1);
-  setDitherAdjustment('ditherBrightness', 0, 0);
-  setDitherAdjustment('ditherSaturation', 1.2, 1);
+  setDitherAdjustment('ditherStrength', 0.6, 1);
+  setDitherAdjustment('ditherContrast', 1.4, 1);
+  setDitherAdjustment('ditherBrightness', 0.9, 1);
+  setDitherAdjustment('ditherSaturation', 1.1, 1);
   applyDither();
 }
 
@@ -2707,12 +2852,12 @@ function getCalendarStyleProfile() {
   return {
     width: canvas?.width || 768,
     height: canvas?.height || 552,
-    numericColorMode: mode === 'fourColor' ? 4 : (mode === 'threeColor' ? 3 : 2)
+    numericColorMode: mode === 'sevenColor' ? 7 : (mode === 'fourColor' ? 4 : (mode === 'threeColor' ? 3 : 2))
   };
 }
 
 function getCalendarPreviewColors(profile) {
-  if (profile.numericColorMode === 4) return CALENDAR_PREVIEW_COLORS;
+  if (profile.numericColorMode >= 4) return CALENDAR_PREVIEW_COLORS;
   if (profile.numericColorMode === 3) return { ...CALENDAR_PREVIEW_COLORS, yellow: CALENDAR_PREVIEW_COLORS.white };
   return { ...CALENDAR_PREVIEW_COLORS, red: CALENDAR_PREVIEW_COLORS.black, yellow: CALENDAR_PREVIEW_COLORS.white };
 }
@@ -2881,7 +3026,7 @@ function getCalendarWeekdays(weekStart) {
 }
 
 function getCalendarAccent(profile, settings, colors) {
-  if (settings.accent === 'yellow') return profile.numericColorMode === 4 ? colors.yellow : colors.black;
+  if (settings.accent === 'yellow') return profile.numericColorMode >= 4 ? colors.yellow : colors.black;
   if (settings.accent === 'black') return colors.black;
   return colors.red;
 }
@@ -2889,7 +3034,7 @@ function getCalendarAccent(profile, settings, colors) {
 function drawCalendarMonthGrid(context, date, profile, settings, bounds, options = {}) {
   const colors = getCalendarPreviewColors(profile);
   const accent = getCalendarAccent(profile, settings, colors);
-  const softAccent = profile.numericColorMode === 4 ? colors.yellow : colors.white;
+  const softAccent = profile.numericColorMode >= 4 ? colors.yellow : colors.white;
   const weekStart = Number(document.getElementById('weekStart')?.value) || 0;
   const year = date.getFullYear();
   const month = date.getMonth();
@@ -2994,7 +3139,7 @@ function drawCalendarStyle(context, date, profile) {
   const settings = getCalendarStyleSettings();
   const colors = getCalendarPreviewColors(profile);
   const accent = getCalendarAccent(profile, settings, colors);
-  const softAccent = profile.numericColorMode === 4 ? colors.yellow : colors.white;
+  const softAccent = profile.numericColorMode >= 4 ? colors.yellow : colors.white;
   const { width, height } = profile;
   const scale = calendarStyleScale(profile);
   const pad = Math.max(12, Math.round(width * 0.035));
@@ -3648,7 +3793,7 @@ function initEventHandlers() {
     applyDither();
   });
   document.getElementById("ditherBrightness").addEventListener("input", (e) => {
-    document.getElementById("ditherBrightnessValue").innerText = parseFloat(e.target.value).toFixed(0);
+    document.getElementById("ditherBrightnessValue").innerText = parseFloat(e.target.value).toFixed(1);
     applyDither();
   });
   document.getElementById("ditherSaturation").addEventListener("input", (e) => {
