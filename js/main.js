@@ -8,12 +8,11 @@ let currentPinsValue = '';
 let ditherSourceImageData = null;
 let ditherPreviewActive = false;
 let pageExitDisconnecting = false;
-let slotState = { count: 0, pageStart: 0, pageCount: 0, usedMask: 0, selected: null, flashSize: 0, fingerprints: [] };
+let slotState = { count: 0, usedMask: 0, selected: null, fingerprints: [] };
 let slotReadState = null;
 let slotImageCache = new Map();
 let slotImageCacheScope = '';
 let slotPreviewPending = new Set();
-let slotProtocolV2 = false;
 let rleSupport = false;
 let slotStreamSupport = false;
 let clockFontSupport = false;
@@ -46,7 +45,6 @@ const DEFAULT_SLOT_READ_RAW_CHUNK_SIZE = 256;
 const SLOT_READ_TIMEOUT_MS = 5000;
 const SLOT_READ_INFO_TIMEOUT_MS = 8000;
 const SLOT_CHUNK_MAX_RETRIES = 2;
-const SLOT_PAGE_SIZE = 18;
 const IMAGE_REFRESH_TIMEOUT_MS = 95000;
 const SLOT_IMAGE_CACHE_PREFIX = 'epd-slot-preview-v2:';
 const SLOT_PREVIEW_MAX_EDGE = 480;
@@ -205,13 +203,12 @@ function resetVariables(options = {}) {
   msgIndex = 0;
   bleWriteChain = Promise.resolve();
   currentPinsValue = '';
-  slotState = { count: 0, pageStart: 0, pageCount: 0, usedMask: 0, selected: null, flashSize: 0, fingerprints: [] };
+  slotState = { count: 0, usedMask: 0, selected: null, fingerprints: [] };
   if (slotReadTimer != null) clearTimeout(slotReadTimer);
   slotReadTimer = null;
   slotReadState = null;
   slotImageCache = new Map();
   slotImageCacheScope = '';
-  slotProtocolV2 = false;
   slotPreviewPending = new Set();
   rleSupport = false;
   slotStreamSupport = false;
@@ -700,40 +697,6 @@ function normalizeSlotFingerprint(value) {
   return typeof value === 'string' && /^[0-9a-f]{8}$/i.test(value) ? value.toUpperCase() : null;
 }
 
-function encodeUint32LE(value) {
-  const bytes = new Uint8Array(4);
-  new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
-  return bytes;
-}
-
-function encodeSlotAction(action, slot) {
-  if (!slotProtocolV2) return new Uint8Array([action, slot & 0xFF]);
-  const payload = new Uint8Array(5);
-  payload[0] = action;
-  payload.set(encodeUint32LE(slot), 1);
-  return payload;
-}
-
-function encodeSlotIndex(slot) {
-  return slotProtocolV2 ? encodeUint32LE(slot) : new Uint8Array([slot & 0xFF]);
-}
-
-function isSlotUsed(slot) {
-  const offset = slot - slotState.pageStart;
-  return offset >= 0 && offset < slotState.pageCount && (slotState.usedMask & (1 << offset)) !== 0;
-}
-
-function slotFingerprint(slot) {
-  const offset = slot - slotState.pageStart;
-  return offset >= 0 && offset < slotState.pageCount ? slotState.fingerprints[offset] || null : null;
-}
-
-function formatFlashSize(bytes) {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '未识别 Flash';
-  if (bytes >= 1024 * 1024) return `${Number((bytes / (1024 * 1024)).toFixed(2))} MB Flash`;
-  return `${Number((bytes / 1024).toFixed(1))} KB Flash`;
-}
-
 function slotCacheMatchesFingerprint(entry, fingerprint) {
   return fingerprint == null || normalizeSlotFingerprint(entry && entry.fingerprint) === fingerprint;
 }
@@ -745,11 +708,10 @@ function loadSlotImageCache() {
     slotImageCacheScope = scope;
   }
 
-  const pageEnd = slotState.pageStart + slotState.pageCount;
-  for (let slot = slotState.pageStart; slot < pageEnd; slot++) {
-    const used = isSlotUsed(slot);
+  for (let slot = 0; slot < slotState.count; slot++) {
+    const used = (slotState.usedMask & (1 << slot)) !== 0;
     const pending = slotPreviewPending.has(slot);
-    const fingerprint = slotFingerprint(slot);
+    const fingerprint = slotState.fingerprints[slot] || null;
     let staleCacheRemoved = false;
     if (!used && !pending) {
       removeSlotImageCache(slot);
@@ -858,7 +820,7 @@ function removeSlotImageCache(slot) {
 }
 
 function clearAllSlotImageCaches() {
-  for (const slot of slotImageCache.keys()) removeSlotImageCache(slot);
+  for (let slot = 0; slot < Math.max(slotState.count, 20); slot++) removeSlotImageCache(slot);
   slotImageCache.clear();
 }
 
@@ -866,11 +828,9 @@ function renderSlotGrid(forceDisabled = imageTransferActive || slotActionPending
   const grid = document.getElementById('slotGrid');
   const summary = document.getElementById('slotSummary');
   const hint = document.getElementById('slotHint');
-  const pagination = document.getElementById('slotPagination');
-  if (!grid || !summary || !hint || !pagination) return;
+  if (!grid || !summary || !hint) return;
 
   grid.replaceChildren();
-  pagination.hidden = true;
   if (!isBleConnected()) {
     summary.textContent = '连接设备后读取槽位';
     hint.textContent = '图片保存在设备外置 Flash 中';
@@ -884,9 +844,8 @@ function renderSlotGrid(forceDisabled = imageTransferActive || slotActionPending
   }
 
   let usedCount = 0;
-  const pageEnd = slotState.pageStart + slotState.pageCount;
-  for (let slot = slotState.pageStart; slot < pageEnd; slot++) {
-    const used = isSlotUsed(slot);
+  for (let slot = 0; slot < slotState.count; slot++) {
+    const used = (slotState.usedMask & (1 << slot)) !== 0;
     const cached = slotImageCache.get(slot) || null;
     const previewPending = !used && cached && slotPreviewPending.has(slot);
     if (used) usedCount++;
@@ -961,25 +920,14 @@ function renderSlotGrid(forceDisabled = imageTransferActive || slotActionPending
     grid.appendChild(item);
   }
 
-  const page = slotProtocolV2 ? Math.floor(slotState.pageStart / SLOT_PAGE_SIZE) + 1 : 1;
-  const pages = slotProtocolV2 ? Math.ceil(slotState.count / SLOT_PAGE_SIZE) : 1;
-  summary.textContent = `${formatFlashSize(slotState.flashSize)} · ${slotState.count} 个槽位`;
-  hint.textContent = `${pages > 1 ? `第 ${page}/${pages} 页 · ` : ''}本页已使用 ${usedCount} 个 · “存入”仅保存到设备，不刷新屏幕`;
-  pagination.hidden = pages <= 1;
-  document.getElementById('slotPageStatus').textContent = `${page} / ${pages}`;
-  document.getElementById('slotPrevPage').disabled = forceDisabled || slotState.pageStart === 0;
-  document.getElementById('slotNextPage').disabled = forceDisabled || pageEnd >= slotState.count;
+  summary.textContent = `${slotState.count} 个槽位，已使用 ${usedCount} 个`;
+  hint.textContent = '“存入”仅保存到设备，不刷新屏幕';
 }
 
-async function refreshSlots(start = slotState.pageStart) {
+async function refreshSlots() {
   if (!isBleConnected()) return;
   addLog('正在读取图片槽位...');
-  await write(EpdCmd.GET_SLOTS, encodeUint32LE(Math.max(0, start)));
-}
-
-async function changeSlotPage(direction) {
-  const start = Math.max(0, Math.min(slotState.count - 1, slotState.pageStart + direction * SLOT_PAGE_SIZE));
-  await refreshSlots(start);
+  await write(EpdCmd.GET_SLOTS);
 }
 
 function applySlotsMessage(message) {
@@ -988,25 +936,6 @@ function applySlotsMessage(message) {
   if (!countMatch || parts.length < 2 || !/^(?:0x[0-9a-f]+|\d+)$/i.test(parts[1])) return false;
 
   const count = parseInt(countMatch[1], 10);
-  const dynamicFormat = parts.length >= 6 && parts.slice(1, 6).every((part) => /^\d+$/.test(part));
-  if (dynamicFormat) {
-    slotProtocolV2 = true;
-    const pageStart = parseInt(parts[1], 10);
-    const pageCount = parseInt(parts[2], 10);
-    const usedMask = Number(parts[3]);
-    const selected = parseInt(parts[4], 10);
-    const flashSize = parseInt(parts[5], 10);
-    slotState = {
-      count,
-      pageStart,
-      pageCount,
-      usedMask,
-      selected,
-      flashSize,
-      fingerprints: parts.slice(6, 6 + pageCount).map(normalizeSlotFingerprint)
-    };
-  } else {
-  slotProtocolV2 = false;
   let fingerprintStart = 2;
   let selected = null;
   if (parts[2] != null && /^\d+$/.test(parts[2])) {
@@ -1017,14 +946,10 @@ function applySlotsMessage(message) {
     .map(normalizeSlotFingerprint);
   slotState = {
     count,
-    pageStart: 0,
-    pageCount: count,
     usedMask: Number(parts[1]),
     selected,
-    flashSize: 0,
     fingerprints
   };
-  }
   loadSlotImageCache();
   const eraseAllCompleted = slotEraseAllPending && slotState.usedMask === 0;
   if (slotEraseAllPending && !eraseAllCompleted) {
@@ -1052,7 +977,7 @@ async function saveImageToSlot(slot) {
     addLog(`槽位 ${slot + 1} 未存入：尚未选择图片。`);
     return;
   }
-  const used = isSlotUsed(slot);
+  const used = (slotState.usedMask & (1 << slot)) !== 0;
   if (used && !confirm(`槽位 ${slot + 1} 已有图片，确认覆盖？`)) return;
   const refreshAfterSave = document.getElementById('slotRefreshAfterSave').checked;
   await sendimg({ slot, refreshAfterSave });
@@ -1062,7 +987,7 @@ async function freeImageSlot(slot) {
   if (imageTransferActive || slotActionPending) return;
   if (!confirm(`确认删除槽位 ${slot + 1} 的图片？`)) return;
   setSlotActionPending(true);
-  if (await write(EpdCmd.FREE_SLOT, encodeSlotIndex(slot))) {
+  if (await write(EpdCmd.FREE_SLOT, new Uint8Array([slot]))) {
     removeSlotImageCache(slot);
     renderSlotGrid(true);
     addLog(`槽位 ${slot + 1} 删除命令已发送。`);
@@ -1072,7 +997,7 @@ async function freeImageSlot(slot) {
 }
 
 async function freeAllImageSlots() {
-  if (imageTransferActive || slotActionPending || slotReadState || slotState.count === 0) return;
+  if (imageTransferActive || slotActionPending || slotReadState || slotState.usedMask === 0) return;
   if (!confirm('确认擦除全部图片槽位？所有已保存图片都将永久删除，此操作不可恢复。')) return;
 
   slotEraseAllPending = true;
@@ -1080,7 +1005,7 @@ async function freeAllImageSlots() {
   const status = document.getElementById('slotReadStatus');
   status.hidden = false;
   status.textContent = '正在擦除全部图片槽位，请勿断开连接...';
-  if (await write(EpdCmd.FREE_SLOT, encodeSlotIndex(0xFFFFFFFF))) {
+  if (await write(EpdCmd.FREE_SLOT, new Uint8Array([0xFF]))) {
     addLog('全部图片槽位擦除命令已发送。');
   } else {
     slotEraseAllPending = false;
@@ -1092,7 +1017,7 @@ async function freeAllImageSlots() {
 async function displayImageSlot(slot) {
   if (imageTransferActive || slotActionPending) return;
   setSlotActionPending(true);
-  if (await write(EpdCmd.SET_SLOT, encodeSlotAction(1, slot))) {
+  if (await write(EpdCmd.SET_SLOT, new Uint8Array([1, slot]))) {
     addLog(`已请求设备显示槽位 ${slot + 1}。`);
   } else {
     setSlotActionPending(false);
@@ -1191,7 +1116,7 @@ function completeImageRefresh() {
 }
 
 async function startSlotSlide(randomMode = false) {
-  if (slotState.count === 0) {
+  if (slotState.usedMask === 0) {
     alert('请先存入至少一张图片，再启动轮播。');
     addLog('轮播未启动：没有可用的图片槽。');
     return false;
@@ -1252,7 +1177,7 @@ async function requestSlotImageInfo(state) {
     }
   }, SLOT_READ_INFO_TIMEOUT_MS);
 
-  if (!await write(EpdCmd.GET_IMAGE, encodeSlotIndex(state.slot), false) && slotReadState === state) {
+  if (!await write(EpdCmd.GET_IMAGE, new Uint8Array([state.slot]), false) && slotReadState === state) {
     if (state.infoAttempts < 2) {
       addLog('读取命令发送失败，正在重试。');
       void requestSlotImageInfo(state);
@@ -1314,10 +1239,7 @@ async function startSlotImageStream() {
   state.nextChunkIndex = 0;
   state.expectedChunk = null;
   armSlotChunkTimeout(0);
-  const request = new Uint8Array(slotProtocolV2 ? 5 : 2);
-  request.set(encodeSlotIndex(state.slot));
-  request[request.length - 1] = 1;
-  if (!await write(EpdCmd.GET_IMAGE, request, false) && slotReadState === state) {
+  if (!await write(EpdCmd.GET_IMAGE, new Uint8Array([state.slot, 1]), false) && slotReadState === state) {
     failSlotImageRead('连续读取命令发送失败。');
   }
 }
@@ -1330,10 +1252,7 @@ async function requestSlotChunk(index, retry = false) {
   state.nextChunkIndex = index;
   state.expectedChunk = null;
   armSlotChunkTimeout(index);
-  const request = new Uint8Array(slotProtocolV2 ? 6 : 3);
-  request.set(encodeSlotIndex(state.slot));
-  request[request.length - 2] = (index >> 8) & 0xFF;
-  request[request.length - 1] = index & 0xFF;
+  const request = new Uint8Array([state.slot, (index >> 8) & 0xFF, index & 0xFF]);
   if (!await write(EpdCmd.GET_IMAGE, request, false) && slotReadState === state &&
     state.nextChunkIndex === index) {
     retrySlotChunk(index, '请求失败');
@@ -1583,7 +1502,7 @@ function finishSlotImageRead() {
         colorId: meta.colorId,
         dataUrl: createSlotPreviewDataUrl(imageData),
         previewKind: 'device',
-        fingerprint: slotFingerprint(meta.slot),
+        fingerprint: slotState.fingerprints[meta.slot] || null,
         savedAt: new Date().getTime()
       });
     }
@@ -1665,22 +1584,14 @@ async function writeImage(data, step = 'bw', waitForPrepare = false) {
   return true;
 }
 
-async function handleDriverChange() {
-  updateDitcherOptions();
-  if (!isBleConnected()) return;
-  await setDriver({ updateOptions: false });
-}
-
-async function setDriver(options = {}) {
+async function setDriver() {
   updateButtonStatus(true);
-  const driverSelect = document.getElementById("epddriver");
-  driverSelect.disabled = true;
 
   try {
-    if (options.updateOptions !== false) updateDitcherOptions();
+    updateDitcherOptions();
 
     const pins = document.getElementById("epdpins").value.trim().toLowerCase();
-    const driver = driverSelect.value;
+    const driver = document.getElementById("epddriver").value;
 
     if (pins !== currentPinsValue) {
       if (!await write(EpdCmd.SET_PINS, pins, true)) return;
@@ -1691,9 +1602,7 @@ async function setDriver(options = {}) {
     if (!await write(EpdCmd.INIT, driver, true)) return;
 
     addLog("驱动已更新。");
-    await refreshSlots(0);
   } finally {
-    driverSelect.disabled = false;
     updateButtonStatus();
   }
 }
@@ -2097,7 +2006,7 @@ async function sendimg(options = {}) {
   if (targetSlot != null) {
     cacheCurrentSlotPreview(targetSlot, processedData, ditherMode);
     if (targetSlot < 0 || targetSlot >= slotState.count ||
-      !await write(EpdCmd.SET_SLOT, encodeSlotAction(0, targetSlot))) {
+      !await write(EpdCmd.SET_SLOT, new Uint8Array([0, targetSlot]))) {
       addLog('槽位写入准备失败。');
       removeSlotImageCache(targetSlot);
       imageTransferActive = false;
@@ -2152,7 +2061,7 @@ async function sendimg(options = {}) {
   }
 
   if (!transferOk) {
-    if (targetSlot != null) await write(EpdCmd.SET_SLOT, encodeSlotAction(0, 0xFFFFFFFF));
+    if (targetSlot != null) await write(EpdCmd.SET_SLOT, new Uint8Array([0, slotState.count]));
     if (targetSlot != null) removeSlotImageCache(targetSlot);
     setStatus('图片发送失败。');
     imageTransferActive = false;
@@ -2168,7 +2077,7 @@ async function sendimg(options = {}) {
   setStatus(savingSlot ? '图片数据发送完成，正在保存槽位...' : '图片数据发送完成，正在刷新屏幕...');
   startImageRefreshWait(targetSlot != null ? 'slot' : 'refresh');
   const completionSent = savingSlot
-    ? await write(EpdCmd.SET_SLOT, encodeSlotAction(refreshAfterSave ? 3 : 2, targetSlot))
+    ? await write(EpdCmd.SET_SLOT, new Uint8Array([refreshAfterSave ? 3 : 2, targetSlot]))
     : await write(EpdCmd.REFRESH);
   if (!completionSent) {
     cancelImageRefreshWait();
@@ -2245,9 +2154,9 @@ function updateButtonStatus(forceDisabled = imageTransferActive || slotActionPen
   });
   if (ledColorDisabled) closeLedColorPopover();
   document.getElementById("refreshSlotsButton").disabled = status;
-  document.getElementById("eraseAllSlotsButton").disabled = status || slotState.count === 0 ? 'disabled' : null;
-  document.getElementById("startSlotSlideButton").disabled = status || slotState.count === 0 ? 'disabled' : null;
-  document.getElementById("randomSlotSlideButton").disabled = status || slotState.count === 0 ? 'disabled' : null;
+  document.getElementById("eraseAllSlotsButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
+  document.getElementById("startSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
+  document.getElementById("randomSlotSlideButton").disabled = status || slotState.usedMask === 0 ? 'disabled' : null;
   document.getElementById("stopSlotSlideButton").disabled = status;
   document.getElementById('clockFontUploadButton').disabled = Boolean(status) || !clockFontSupport;
   document.getElementById('clockFontEraseButton').disabled = Boolean(status) || !clockFontSupport;

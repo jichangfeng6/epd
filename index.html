@@ -12,7 +12,7 @@
 <body>
 	<nav class="global-nav" aria-label="全局导航">
 		<div class="global-nav-inner">
-			<a class="global-brand" href="#">墨水屏日历</a>
+			<a class="global-brand" href="#">EPD</a>
 			<a href="#bluetooth-panel">蓝牙</a>
 			<a href="#device-panel">模式</a>
 			<a href="#slot-panel">图库</a>
@@ -25,6 +25,7 @@
 		</div>
 	</div>
 	<div class="main">
+		<h3>墨水屏日历</h3>
 		<fieldset id="bluetooth-panel">
 			<legend>蓝牙连接</legend>
 			<div class="flex-container">
@@ -75,7 +76,7 @@
 					<input id="epdpins" type="text" value="">
 					<button id="setDriverbutton" type="button" class="primary" onclick="setDriver()">确定</button>
 					<label for="epddriver">驱动</label>
-					<select id="epddriver" onchange="handleDriverChange()">
+					<select id="epddriver" onchange="updateDitcherOptions()">
 						<option value="18" data-color="threeColor" data-size="2.13_128_250">2.13寸 (三色, SSD1619)</option>
 						<option value="19" data-color="threeColor" data-size="2.13_250_122">2.13寸 低分(三色, SSD1619)</option>
 						<option value="0d" data-color="fourColor" data-size="3.7_416_240">3.7BWRY (四色, GDEM037F51)</option>
@@ -286,11 +287,6 @@
 				<button id="stopSlotSlideButton" type="button" class="secondary" onclick="stopSlotSlide()" disabled>停止</button>
 			</div>
 			<div id="slotGrid" class="slot-grid" aria-live="polite"></div>
-			<div id="slotPagination" class="slot-pagination" hidden>
-				<button id="slotPrevPage" type="button" class="secondary" title="上一页" aria-label="上一页" onclick="changeSlotPage(-1)">&#8249;</button>
-				<span id="slotPageStatus"></span>
-				<button id="slotNextPage" type="button" class="secondary" title="下一页" aria-label="下一页" onclick="changeSlotPage(1)">&#8250;</button>
-			</div>
 			<div id="slotReadStatus" class="slot-read-status" hidden></div>
 		</fieldset>
 		<fieldset id="image-panel">
